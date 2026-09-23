@@ -1,0 +1,10 @@
+# ============================================================
+#  NJUPT campus network auto login - Python requirements
+#  校园网自动登录依赖清单
+#
+#  本项目纯 Python 标准库实现，零第三方依赖：
+#  无需安装任何 pip 包，pip install -r requirements.txt 也不会装任何东西。
+#
+#  唯一要求：Python 3.6+（建议 3.10+，python.org 下载）
+#  安装 Python 时务必勾选 "Add python.exe to PATH"
+# ============================================================

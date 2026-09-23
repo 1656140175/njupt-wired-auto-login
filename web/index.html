@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CampusPi 校园网管理</title>
+<style>
+  :root { --bg:#10151c; --card:#1a2230; --line:#2a3547; --tx:#dbe4f0; --dim:#8aa0b8;
+          --ok:#37d67a; --bad:#ff6b6b; --warn:#ffb84d; --acc:#4da3ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--tx);
+         font:14px/1.6 "Microsoft YaHei", "PingFang SC", sans-serif; }
+  header { padding:18px 24px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:20px; }
+  main { max-width:980px; margin:0 auto; padding:20px 24px 60px; }
+  section { background:var(--card); border:1px solid var(--line);
+            border-radius:10px; padding:18px 20px; margin-bottom:18px; }
+  section h2 { margin:0 0 14px; font-size:16px; color:var(--acc); }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+           gap:12px; margin-bottom:18px; }
+  .card { background:var(--card); border:1px solid var(--line);
+          border-radius:10px; padding:14px; }
+  .card .k { color:var(--dim); font-size:12px; }
+  .card .v { font-size:18px; font-weight:600; margin-top:4px; word-break:break-all; }
+  .badge { display:inline-block; padding:2px 10px; border-radius:20px; font-size:12px; }
+  .b-ok { background:rgba(55,214,122,.15); color:var(--ok); }
+  .b-bad { background:rgba(255,107,107,.15); color:var(--bad); }
+  .b-dim { background:rgba(138,160,184,.15); color:var(--dim); }
+  .b-warn { background:rgba(255,184,77,.15); color:var(--warn); }
+  .row { display:grid; grid-template-columns:220px 1fr; gap:10px 14px;
+         align-items:center; margin-bottom:10px; }
+  .row label { color:var(--dim); text-align:right; }
+  input, select, textarea { background:#0d1320; color:var(--tx);
+         border:1px solid var(--line); border-radius:6px; padding:7px 10px;
+         font:inherit; width:100%; }
+  textarea { font-family:Consolas, monospace; font-size:12px; }
+  button { background:var(--acc); color:#04121f; border:0; border-radius:6px;
+           padding:8px 18px; font:inherit; font-weight:600; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--acc);
+                 border:1px solid var(--acc); }
+  button:hover { filter:brightness(1.1); }
+  .actions { display:flex; gap:10px; margin-top:6px; flex-wrap:wrap; }
+  .hint { color:var(--dim); font-size:12px; }
+  #toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%);
+           background:#0d1320; border:1px solid var(--acc); border-radius:8px;
+           padding:10px 18px; display:none; max-width:80%; }
+  #logview { background:#0d1320; border:1px solid var(--line); border-radius:6px;
+             padding:10px; height:220px; overflow-y:auto; white-space:pre-wrap;
+             font:12px/1.5 Consolas, monospace; }
+  #authbox { display:flex; gap:8px; align-items:center; }
+  #authbox input { width:130px; }
+  .isp-item { display:grid; grid-template-columns:1fr 100px 1fr auto; gap:8px;
+              margin-bottom:8px; align-items:center; }
+  .chip { padding:2px 10px; border-radius:20px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📡 CampusPi 校园网自动连接</h1>
+  <span id="authbox" style="display:none">
+    账号 <input id="authUser" placeholder="admin">
+    密码 <input id="authPass" type="password">
+    <button class="ghost" onclick="saveAuth()">登录</button>
+  </span>
+</header>
+<main>
+  <div class="cards" id="cards"></div>
+
+  <section>
+    <h2>🖧 网卡检测 <span class="hint">（自动刷新）</span></h2>
+    <div id="ifaceList"></div>
+  </section>
+
+  <section>
+    <h2>🌐 校园网设置</h2>
+    <div class="row"><label>认证适配器</label>
+      <select id="c_adapter">
+        <option value="drcom">drcom（哆点，南邮默认）</option>
+        <option value="eportal">eportal（锐捷，备用）</option>
+        <option value="srun">srun（深澜，备用）</option>
+        <option value="generic">generic（通用表单，自定义）</option>
+      </select></div>
+    <div id="drcomBox" style="display:none">
+      <div class="row"><label>哆点网关地址</label>
+        <input id="d_host" placeholder="10.10.244.11"></div>
+      <div class="row"><label>端口</label>
+        <input id="d_port" type="number" placeholder="801"></div>
+      <div class="row"><label>登录路径</label>
+        <input id="d_path" placeholder="/eportal/?c=ACSetting&a=Login"></div>
+      <div class="row"><label>附加参数(JSON)</label>
+        <input id="d_extra" placeholder='{"0MKKey":"123456"}'></div>
+      <div class="hint">南邮 a79.htm 页面参数：DDDDD=账号、upass=密码（明文），
+        成功/失败判定看跳转页 Dr.COMWebLoginID_3.htm / _2.htm。</div>
+    </div>
+    <div id="eportalBox" style="display:none">
+      <div class="row"><label>eportal 网关地址</label>
+        <input id="e_host" placeholder="10.10.244.11"></div>
+      <div class="row"><label>端口</label>
+        <input id="e_port" type="number" placeholder="801"></div>
+      <div class="row"><label>路径</label>
+        <input id="e_path" placeholder="/eportal/portal/login"></div>
+      <div class="hint">南邮：GET 单步登录，运营商=账号后缀
+        （校园网无后缀 / 移动 @cmcc / 电信 @njxy），登录后以在线探测为准。</div>
+    </div>
+    <div class="row"><label>认证服务器地址</label>
+      <input id="c_host" placeholder="p.njupt.edu.cn"></div>
+    <div class="row"><label>协议</label>
+      <select id="c_protocol"><option>https</option><option>http</option></select></div>
+    <div class="row"><label>校园网账号</label>
+      <input id="c_username" placeholder="学号" autocomplete="off"></div>
+    <div class="row"><label>校园网密码</label>
+      <input id="c_password" type="password" placeholder="留空表示保持不变"
+             autocomplete="new-password"></div>
+    <div class="row"><label>运营商</label>
+      <select id="c_isp"></select></div>
+    <div class="row"><label>密码加密方式</label>
+      <select id="c_enc">
+        <option value="auto">auto（自动嗅探，推荐）</option>
+        <option value="md5">md5</option>
+        <option value="token_md5">token$md5</option>
+        <option value="base64">base64</option>
+        <option value="token_base64">token$base64</option>
+      </select></div>
+    <div class="row"><label>自动连接间隔（秒）</label>
+      <input id="c_interval" type="number" min="60" max="86400"></div>
+    <div class="row"><label>校园网网卡</label>
+      <input id="c_iface" placeholder="eth0"></div>
+
+    <h3 style="color:var(--dim);font-size:13px">运营商列表（账号后缀 + ac_id + 附加参数）</h3>
+    <div id="ispsBox"></div>
+    <div class="actions">
+      <button class="ghost" onclick="addIsp()">+ 添加运营商</button>
+    </div>
+
+    <div id="genericBox" style="display:none;margin-top:14px">
+      <h3 style="color:var(--dim);font-size:13px">通用表单适配器（仅选 generic 时生效）</h3>
+      <div class="row"><label>登录 URL</label><input id="g_url"></div>
+      <div class="row"><label>请求方式</label>
+        <select id="g_method"><option>POST</option><option>GET</option></select></div>
+      <div class="row"><label>参数(JSON，占位符 {username}/{password}/{isp}/{acid}/{ip})</label>
+        <textarea id="g_params" rows="3"></textarea></div>
+      <div class="row"><label>成功标记（响应包含该字符串即成功）</label>
+        <input id="g_key"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>📶 热点设置（USB Wi-Fi 网卡，限 4 设备）</h2>
+    <div class="row"><label>启用热点</label>
+      <select id="h_enabled"><option value="true">启用</option>
+        <option value="false">停用</option></select></div>
+    <div class="row"><label>无线网卡接口</label><input id="h_iface" placeholder="wlan0"></div>
+    <div class="row"><label>SSID</label><input id="h_ssid" maxlength="32"></div>
+    <div class="row"><label>Wi-Fi 密码（8-63 位）</label>
+      <input id="h_password" type="password" placeholder="留空表示保持不变"></div>
+    <div class="row"><label>最大接入设备数</label>
+      <input id="h_max" type="number" min="1" max="50"></div>
+    <div class="row"><label>信道（2.4G 建议 1/6/11）</label>
+      <input id="h_channel" type="number" min="0" max="14"></div>
+  </section>
+
+  <section>
+    <h2>💻 PC 有线设置（USB 转网口线 -> Windows）</h2>
+    <div class="row"><label>PC 网卡接口</label>
+      <input id="p_iface" placeholder="auto（自动探测）"></div>
+    <div class="row"><label>接入时立即尝试次数</label>
+      <input id="p_attempts" type="number" min="1" max="10"></div>
+    <div class="row"><label>尝试间隔（秒）</label>
+      <input id="p_delay" type="number" min="1" max="300"></div>
+    <div class="hint">Windows 电脑网卡设为自动获取 IP 即可，
+      登录后台地址：<b>http://192.168.9.1:8080</b></div>
+  </section>
+
+  <section>
+    <h2>🌙 静默时段（夜间断网不重连）</h2>
+    <div class="row"><label>启用静默时段</label>
+      <select id="q_enabled"><option value="true">启用</option>
+        <option value="false">停用</option></select></div>
+    <div class="row"><label>开始（HH:MM）</label><input id="q_start" placeholder="00:00"></div>
+    <div class="row"><label>结束（HH:MM）</label><input id="q_end" placeholder="06:00"></div>
+    <div class="hint">窗口结束后（如 6:00）会自动立即尝试重连。树莓派无 RTC，
+      程序会自动 NTP 同步时间；系统时间不可信时不启用静默，避免错过重连。
+      <b>修改后请点页面底部"💾 保存并应用"生效</b>。</div>
+  </section>
+
+  <section>
+    <h2>🔧 Web 管理后台</h2>
+    <div class="row"><label>端口</label><input id="w_port" type="number"></div>
+    <div class="row"><label>管理账号</label><input id="w_username" placeholder="admin"></div>
+    <div class="row"><label>管理密码（留空=不要求登录）</label>
+      <input id="w_password" type="password" placeholder="留空表示保持不变"></div>
+  </section>
+
+  <section>
+    <h2>操作</h2>
+    <div class="actions">
+      <button onclick="saveAll()">💾 保存并应用</button>
+      <button class="ghost" onclick="testLogin()">⚡ 立即测试登录</button>
+      <button class="ghost" onclick="doLogout()">🚪 注销</button>
+      <button class="ghost" onclick="restartHotspot()">🔄 重启热点</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>📜 运行日志 <span class="hint" id="logTime"></span></h2>
+    <div id="logview"></div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+let AUTH = null;
+const $ = id => document.getElementById(id);
+let cfg = null;
+
+function toast(msg, bad) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.style.borderColor = bad ? "#ff6b6b" : "#4da3ff";
+  t.style.display = "block";
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.style.display = "none", 4000);
+}
+
+function authHeader() {
+  return AUTH ? { "Authorization": "Basic " +
+      btoa(unescape(encodeURIComponent(AUTH.u + ":" + AUTH.p))) } : {};
+}
+
+async function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({ "Content-Type": "application/json" },
+                               authHeader(), opts.headers || {});
+  const res = await fetch(path, opts);
+  if (res.status === 401) { $("authbox").style.display = "flex"; throw new Error("需要登录"); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(JSON.stringify(data));
+  return data;
+}
+
+function saveAuth() {
+  AUTH = { u: $("authUser").value.trim(), p: $("authPass").value };
+  $("authbox").style.display = "none";
+  toast("已登录");
+  loadConfig(); loadStatus();
+}
+
+// ------------------------------------------------------------ 状态卡片
+function esc(s) { return String(s == null ? "" : s); }
+
+function renderStatus(s) {
+  const badge = v => v === true ? '<span class="badge b-ok">在线</span>'
+    : v === false ? '<span class="badge b-bad">离线</span>'
+    : '<span class="badge b-dim">未知</span>';
+  const link = s.pc_link === true ? "已接入" : s.pc_link === false ? "未插入" : "—";
+  const hs = s.hotspot;
+  const hsBadge = !hs.enabled ? '<span class="badge b-dim">已停用</span>'
+    : !hs.iface_present ? '<span class="badge b-bad">无线网卡未检测到</span>'
+    : !hs.password_set ? '<span class="badge b-bad">未设置密码</span>'
+    : hs.running ? '<span class="badge b-ok">运行中</span>'
+    : '<span class="badge b-warn">未运行</span>';
+  const quiet = !s.quiet_enabled ? '<span class="badge b-dim">已停用</span>'
+    : s.quiet_hours ? '<span class="badge b-warn">静默中</span>'
+    : '<span class="badge b-ok">正常</span>';
+  const quietHint = "时段 " + esc(s.quiet_window) +
+    (s.quiet_enabled ? "" : "（静默已关闭）");
+  const lastLogin = s.last_login && s.last_login.msg
+    ? (s.last_login.ts + " " + s.last_login.msg) : "—";
+  const cards = [
+    ["校园网", badge(s.online), ""],
+    ["静默时段", quiet, quietHint],
+    ["校园网 IP", esc(s.campus_ip), s.campus_iface],
+    ["PC 有线", esc(link), esc(s.pc_iface)],
+    ["热点", hsBadge,
+     "设备 " + hs.clients + "/" + hs.max_clients + " · " + esc(hs.iface)],
+    ["上次登录", esc(lastLogin), ""],
+    ["系统时间", esc(s.system_time),
+     s.time_trustworthy ? "时间可信" : "时间不可信（自动同步中）"],
+  ];
+  $("cards").innerHTML = cards.map(c =>
+    '<div class="card"><div class="k">' + c[0] + '</div><div class="v">' +
+    c[1] + '</div><div class="hint">' + esc(c[2]) + '</div></div>').join("");
+  renderInterfaces(s.interfaces);
+}
+
+function renderInterfaces(ifaces) {
+  const box = $("ifaceList");
+  if (!ifaces || !ifaces.length) {
+    box.innerHTML = '<div class="hint">未检测到物理网卡（树莓派上才有）</div>';
+    return;
+  }
+  box.innerHTML = ifaces.map(n => {
+    const link = n.carrier === true ? '<span class="badge b-ok">已连接</span>'
+      : n.carrier === false ? '<span class="badge b-dim">未插入</span>'
+      : '<span class="badge b-dim">无</span>';
+    const ap = n.type === "无线WiFi" ? " · " + (n.ap_supported ? "AP可做热点" : "AP不支持") : "";
+    return '<div class="row" style="grid-template-columns:90px 100px 80px 140px 1fr">' +
+      '<b>' + esc(n.name) + '</b><span>' + esc(n.type) + '</span>' + link +
+      '<span>' + esc(n.ip || "-") + '</span>' +
+      '<span class="hint">' + esc((n.driver || "") + " " +
+        (n.role ? "[" + n.role.join(",") + "]" : "")) + ap + '</span></div>';
+  }).join("");
+}
+
+// ------------------------------------------------------------ 配置表单
+function renderIsps(isps) {
+  const box = $("ispsBox");
+  box.innerHTML = "";
+  Object.entries(isps).forEach(([name, v]) => {
+    const row = document.createElement("div");
+    row.className = "isp-item";
+    row.innerHTML =
+      '<input data-f="name" value="' + esc(name) + '" placeholder="运营商名">' +
+      '<input data-f="suffix" value="' + esc(v.username_suffix || "") +
+        '" placeholder="账号后缀">' +
+      '<input data-f="acid" value="' + esc(v.ac_id || "1") + '" placeholder="ac_id">' +
+      '<button class="ghost" onclick="this.parentNode.remove()">删除</button>';
+    box.appendChild(row);
+  });
+}
+
+function addIsp() {
+  const box = $("ispsBox");
+  const row = document.createElement("div");
+  row.className = "isp-item";
+  row.innerHTML = '<input data-f="name" placeholder="运营商名">' +
+    '<input data-f="suffix" placeholder="账号后缀">' +
+    '<input data-f="acid" value="1" placeholder="ac_id">' +
+    '<button class="ghost" onclick="this.parentNode.remove()">删除</button>';
+  box.appendChild(row);
+}
+
+function collectIsps() {
+  const out = {};
+  document.querySelectorAll("#ispsBox .isp-item").forEach(row => {
+    const get = f => row.querySelector('[data-f="' + f + '"]').value.trim();
+    const name = get("name");
+    if (name) out[name] = { username_suffix: get("suffix"),
+                            ac_id: get("acid") || "1", extra: {} };
+  });
+  return out;
+}
+
+function fillForm(c) {
+  const set = (id, v) => { const el = $(id); if (el) el.value = v == null ? "" : v; };
+  set("c_adapter", c.campus.adapter); set("c_host", c.campus.host);
+  set("c_protocol", c.campus.protocol); set("c_username", c.campus.username);
+  set("c_password", ""); set("c_enc", c.campus.enc);
+  set("c_interval", c.campus.check_interval); set("c_iface", c.campus.iface);
+  set("e_host", c.eportal.host); set("e_port", c.eportal.port);
+  set("e_path", c.eportal.path);
+  set("d_host", c.drcom.host); set("d_port", c.drcom.port);
+  set("d_path", c.drcom.path);
+  set("d_extra", JSON.stringify(c.drcom.extra_params || {}));
+  $("drcomBox").style.display =
+    c.campus.adapter === "drcom" ? "block" : "none";
+  $("eportalBox").style.display =
+    c.campus.adapter === "eportal" ? "block" : "none";
+  renderIsps(c.campus.isps);
+  const ISPS_NAME = { campus: "校园用户", telecom: "校园电信",
+                      chinanet: "校园电信", cmcc: "校园移动", mobile: "校园移动" };
+  const ispSel = $("c_isp");
+  ispSel.innerHTML = Object.keys(c.campus.isps).map(n =>
+    '<option value="' + esc(n) + '">' + esc(ISPS_NAME[n] || n) + '（' +
+    esc(n) + '）</option>').join("");
+  ispSel.value = c.campus.isp;
+  $("genericBox").style.display =
+    c.campus.adapter === "generic" ? "block" : "none";
+  set("g_url", c.generic.login_url); set("g_method", c.generic.method);
+  set("g_params", JSON.stringify(c.generic.params, null, 2));
+  set("g_key", c.generic.success_key);
+  set("h_enabled", String(c.hotspot.enabled));
+  set("h_iface", c.hotspot.iface); set("h_ssid", c.hotspot.ssid);
+  set("h_password", ""); set("h_max", c.hotspot.max_clients);
+  set("h_channel", c.hotspot.channel);
+  set("p_iface", c.pc.iface); set("p_attempts", c.pc.attempts);
+  set("p_delay", c.pc.attempt_delay);
+  set("q_enabled", String(c.quiet_hours.enabled));
+  set("q_start", c.quiet_hours.start); set("q_end", c.quiet_hours.end);
+  set("w_port", c.web.port); set("w_username", c.web.username);
+  set("w_password", "");
+  const hint = p => { const el = $(p); if (el) el.placeholder = "已设置（留空保持不变）"; };
+  if (c.campus.has_password) hint("c_password");
+  if (c.hotspot.has_password) hint("h_password");
+  if (c.web.has_password) hint("w_password");
+}
+
+function parseExtra() {
+  try { return JSON.parse($("d_extra").value.trim() || "{}"); }
+  catch (e) { toast("附加参数 JSON 格式错误: " + e.message, true); throw e; }
+}
+
+function collectForm() {
+  const val = id => $(id).value.trim();
+  let params = {};
+  try { params = JSON.parse(val("g_params")); }
+  catch (e) { toast("参数 JSON 格式错误: " + e.message, true); throw e; }
+  return {
+    campus: {
+      adapter: val("c_adapter"), host: val("c_host"),
+      protocol: val("c_protocol"), username: val("c_username"),
+      password: val("c_password"), isp: val("c_isp"),
+      enc: val("c_enc"), check_interval: val("c_interval"),
+      iface: val("c_iface"), isps: collectIsps(),
+    },
+    eportal: { host: val("e_host"), port: val("e_port"),
+               path: val("e_path") },
+    drcom: { host: val("d_host"), port: val("d_port"),
+             path: val("d_path"), extra_params: parseExtra() },
+    generic: { login_url: val("g_url"), method: val("g_method"),
+               params: params, success_key: val("g_key") },
+    hotspot: { enabled: val("h_enabled") === "true", iface: val("h_iface"),
+               ssid: val("h_ssid"), password: val("h_password"),
+               max_clients: val("h_max"), channel: val("h_channel") },
+    pc: { iface: val("p_iface"), attempts: val("p_attempts"),
+          attempt_delay: val("p_delay") },
+    quiet_hours: { enabled: val("q_enabled") === "true",
+                   start: val("q_start"), end: val("q_end") },
+    web: { port: val("w_port"), username: val("w_username"),
+           password: val("w_password") },
+  };
+}
+
+// ------------------------------------------------------------ 动作
+async function loadConfig() {
+  try { cfg = await api("/api/config"); fillForm(cfg); }
+  catch (e) { /* 未认证 */ }
+}
+
+async function loadStatus() {
+  try { renderStatus(await api("/api/status")); } catch (e) { /* 未认证 */ }
+}
+
+async function saveAll() {
+  try {
+    const data = await api("/api/config", { method: "POST",
+      body: JSON.stringify(collectForm()) });
+    toast("保存成功，已应用并触发重连");
+    await loadConfig();
+  } catch (e) { toast("保存失败: " + e.message, true); }
+}
+
+async function testLogin() {
+  try {
+    const data = await api("/api/action/login", { method: "POST", body: "{}" });
+    toast((data.ok ? "✅ " : "❌ ") + (data.msg || ""));
+  } catch (e) { toast("请求失败: " + e.message, true); }
+}
+
+async function restartHotspot() {
+  try {
+    const data = await api("/api/action/restart_hotspot", { method: "POST", body: "{}" });
+    toast("热点重启: " + (data.msg || "完成"));
+  } catch (e) { toast("请求失败: " + e.message, true); }
+}
+
+async function doLogout() {
+  try {
+    const data = await api("/api/action/logout", { method: "POST", body: "{}" });
+    toast("注销: " + (data.msg || "完成"));
+    setTimeout(loadStatus, 3000);
+  } catch (e) { toast("请求失败: " + e.message, true); }
+}
+
+async function loadLogs() {
+  try {
+    const data = await api("/api/logs?lines=200");
+    $("logview").textContent = data.lines || "（暂无日志）";
+    $("logTime").textContent = "更新于 " + new Date().toLocaleTimeString();
+    $("logview").scrollTop = $("logview").scrollHeight;
+  } catch (e) { /* 未认证 */ }
+}
+
+// ------------------------------------------------------------ 启动
+$("c_adapter").addEventListener("change", () => {
+  const v = $("c_adapter").value;
+  $("genericBox").style.display = v === "generic" ? "block" : "none";
+  $("eportalBox").style.display = v === "eportal" ? "block" : "none";
+  $("drcomBox").style.display = v === "drcom" ? "block" : "none";
+});
+loadConfig();
+loadStatus(); loadLogs();
+setInterval(loadStatus, 5000);
+setInterval(loadLogs, 10000);
+</script>
+</body>
+</html>

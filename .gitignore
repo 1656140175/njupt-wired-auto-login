@@ -1,0 +1,25 @@
+# ============================================================
+#  凭据与本地配置 —— 绝对不要提交！
+# ============================================================
+njupt_autologin.conf
+config.json
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 构建产物
+*.zip
+*.log
+*.tmp
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

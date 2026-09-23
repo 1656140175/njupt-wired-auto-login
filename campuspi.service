@@ -1,0 +1,15 @@
+[Unit]
+Description=CampusPi - campus network auto-login & USB hotspot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/campuspi/main.py
+WorkingDirectory=/opt/campuspi
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
