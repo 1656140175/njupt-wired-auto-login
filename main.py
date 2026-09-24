@@ -200,23 +200,32 @@ class App:
 
     def pc_watch(self):
         """检测 Windows 有线接入（USB 网卡链路上升沿），立即尝试登录。
-        自愈：USB 网线拔插导致接口重建/丢 IP 时，自动重新配置静态地址，
-        否则 Windows 拿不到 DHCP（192.168.9.x），管理界面打不开。"""
+        自愈：USB 网卡可能在服务启动后才插入，或拔插后接口被重建/改名/
+        拿到临时地址（169.254.x.x）。这里在接口"出现/改名/地址不符"时
+        立即重配静态地址与转发规则，否则 Windows 拿不到 DHCP
+        （192.168.9.x），管理与互通都失效。"""
         last_heal = 0.0
+        last_iface = None
         while self.running:
             try:
                 # 绕过 30 秒缓存重新探测 PC 接口（接口可能被重建/改名）
                 self.net._pc_iface = None
                 self.net._pc_scan_ts = 0.0
                 iface = self.net.pc_iface
-                # 接口在但无 IP = 拔插后配置丢失，重新配置（节流 5 秒）
-                if iface and not get_ip(iface) and time.time() - last_heal > 5:
+                want = self.config.data["pc"]["gateway"]
+                # 触发条件：接口新出现/改名，或地址不是我们配置的静态地址
+                # （注意不能只判断"无 IP"——接口可能拿到 link-local 地址，
+                #  那样条件永远为假，规则就永远补不上）
+                needs_fix = bool(iface) and (
+                    iface != last_iface or get_ip(iface) != want)
+                if needs_fix and time.time() - last_heal > 5:
                     last_heal = time.time()
-                    logging.warning("PC 接口 %s 无 IP（疑似拔插），重新配置",
+                    logging.warning("PC 接口 %s 新出现/地址不符，重新配置",
                                     iface)
                     self.net.setup_interfaces()
                     self.net.ensure_nat()
                     self.hotspot.apply(restart=True)   # 接口名可能变化，重写 DHCP
+                last_iface = iface
                 current = carrier(iface) if iface else None
                 if self.pc_state is None:
                     if current:
@@ -253,11 +262,21 @@ class App:
                 self._sleep(delay)
 
     def hotspot_watch(self):
+        """热点守护 + 转发规则兜底。
+
+        iptables 规则不持久化（重启即丢），且 USB 网卡可能在服务启动后
+        才插入——那时启动阶段加不上有线/无线互通规则，之后也不会自动补。
+        这里每 30 秒幂等重建一次（-C 检查已存在则跳过，开销可忽略），
+        保证任何接口变化后规则都能在 30 秒内自动补齐。"""
         while self.running:
             try:
                 self.hotspot.watch()
             except Exception:
                 logging.exception("热点守护异常")
+            try:
+                self.net.ensure_nat()
+            except Exception:
+                logging.exception("转发规则兜底异常")
             self._sleep(30)
 
     # ------------------------------------------------------------- 状态/配置

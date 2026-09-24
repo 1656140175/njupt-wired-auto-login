@@ -134,12 +134,16 @@ class Network:
                           int(h["subnet"].split("/")[1]))
 
     def ensure_nat(self):
-        """把 PC 有线/热点子网 NAT 到校园网接口（幂等）。"""
+        """把 PC 有线/热点子网 NAT 到校园网接口（幂等）。
+        注意：iptables 规则不持久化，且 USB 网卡可能在服务启动后才插入，
+        因此本函数会被周期性调用（见 main.hotspot_watch）幂等补齐。"""
         set_ip_forward(True)
         campus = self.campus_iface
-        if not iface_exists(campus):
-            log.error("校园网接口 %s 不存在，跳过 NAT", campus)
-            return
+        campus_ok = bool(campus) and iface_exists(campus)
+        if not campus_ok:
+            # 校园网接口异常也要继续：客户端互通的规则不依赖 campus
+            log.warning("校园网接口 %s 不存在，跳过 NAT（仍配置客户端互通）",
+                        campus or "?")
         run(["iptables", "-P", "FORWARD", "ACCEPT"], timeout=10)
         client_ifaces = []
         if self.pc_iface:
@@ -154,14 +158,16 @@ class Network:
                 return
             run(["iptables", "-t", table, "-A"] + args, timeout=10)
 
-        add_rule("nat", ["POSTROUTING", "-o", campus, "-j", "MASQUERADE"])
-        for client in client_ifaces:
-            add_rule("filter",
-                     ["FORWARD", "-i", client, "-o", campus, "-j", "ACCEPT"])
-            add_rule("filter",
-                     ["FORWARD", "-i", campus, "-o", client,
-                      "-m", "state", "--state", "RELATED,ESTABLISHED",
-                      "-j", "ACCEPT"])
+        if campus_ok:
+            add_rule("nat", ["POSTROUTING", "-o", campus, "-j", "MASQUERADE"])
+            for client in client_ifaces:
+                add_rule("filter",
+                         ["FORWARD", "-i", client, "-o", campus,
+                          "-j", "ACCEPT"])
+                add_rule("filter",
+                         ["FORWARD", "-i", campus, "-o", client,
+                          "-m", "state", "--state", "RELATED,ESTABLISHED",
+                          "-j", "ACCEPT"])
         # 有线(PC) <-> 无线(热点) 客户端互通：两个子网各自直连在本机，
         # 经内核路由转发即可，这里显式放行双向 FORWARD（不做 NAT，
         # 双方看到真实 IP）。不做此规则时手机访问不到电脑。
