@@ -15,14 +15,23 @@ user=
 pass=
 
 # 运营商后缀（账号最终格式 = user + suffix）：
-#   移动   @cmcc      （南邮移动宽带）
-#   电信   @njxy      （南邮电信宽带）
+#   移动   @cmcc      （南邮移动宽带；部分门户为 @dx/@lt 组合，以登录页为准）
+#   电信   @njxy
+#   联通   @lt
 #   校园网 留空即可（无后缀）
 suffix=@cmcc
 
 # ---------- 网关（一般不用改） ----------
-# 南邮哆点认证网关地址
-gateway=http://10.10.244.11:801/eportal/?c=ACSetting&a=Login
+# 2026-11 网关升级后的新版 ePortal 登录接口。
+# 旧地址 http://10.10.244.11:801/eportal/?c=ACSetting&a=Login 已失效，
+# 程序会自动把旧地址归一化为下面这个接口。
+gateway=http://10.10.244.11:801/eportal/portal/login
+
+# 账号前缀：PC 端固定 ,0,（手机端才是 ,1,），一般不用改
+prefix=,0,
+
+# wlan_user_mac：新旧接口都接受全 0，保持默认即可
+mac=000000000000
 
 # ---------- 常驻检测（watch 模式） ----------
 # 检测间隔（秒）：在线时每周期仅 ping 网关确认链路；

@@ -12,10 +12,13 @@
   njupt_autologin_stop.bat      停止后台常驻进程
   njupt_autologin_autostart.bat 一键安装/卸载开机自启（任务计划程序）
   njupt_autologin.py            主程序
+  connect_pi_rdp.bat            一键打开树莓派远程桌面（需先在 Web
+                                后台安装/启动 RDP，地址 192.168.9.1）
 
 二、首次使用（3 步）
   1. 编辑 njupt_autologin.conf，填 user（学号）、pass（密码）、
-     suffix（移动@cmcc / 电信@njxy / 校园网留空）
+     suffix（移动@cmcc / 电信@njxy / 联通@lt / 校园网留空，
+     以登录页 a79.htm 实际显示的运营商后缀为准）
   2. 双击 njupt_autologin.bat 验证（看到"登录成功"即 OK）
   3. 双击 njupt_autologin_autostart.bat 按 1 注册开机自启
 

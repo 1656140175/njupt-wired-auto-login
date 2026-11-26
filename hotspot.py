@@ -60,13 +60,35 @@ class Hotspot:
         lines.append("address=/connectivitycheck.gstatic.com/%s" % pc["gateway"])
         pc_iface = self.app.net.pc_iface
         if pc_iface:
+            # CAMPUSPI_OFFLINE_DNS_V1
+            # 校园网离线时不要把 PC 的默认网关/DNS 指向本机，否则 PC 会
+            # 优先走有线，树莓派没登录校园网时 DNS 全断，必须拔线才能上网。
+            # 离线时只下发公共 DNS、不下发 option 3，PC 继续使用 Wi-Fi 的
+            # 默认路由；管理页仍可通过直连 192.168.9.0/24 访问。
+            online = bool(getattr(self.app, "online", False))
+            share_online_only = bool(pc.get("share_online_only", True))
+            pc_online = online or not share_online_only
+            lease = "5m" if pc_online else "2m"
             lines += [
                 "interface=%s" % pc_iface,
-                "dhcp-range=interface:%s,%s,%s,255.255.255.0,12h"
-                % (pc_iface, pc["dhcp_start"], pc["dhcp_end"]),
-                "dhcp-option=interface:%s,3,%s" % (pc_iface, pc["gateway"]),
-                "dhcp-option=interface:%s,6,%s" % (pc_iface, pc["gateway"]),
+                "dhcp-range=interface:%s,%s,%s,255.255.255.0,%s"
+                % (pc_iface, pc["dhcp_start"], pc["dhcp_end"], lease),
             ]
+            if pc_online:
+                lines += [
+                    "dhcp-option=interface:%s,3,%s" % (pc_iface, pc["gateway"]),
+                    "dhcp-option=interface:%s,6,%s" % (pc_iface, pc["gateway"]),
+                ]
+            else:
+                # 离线时显式下发“空”的 option 3，抑制 dnsmasq 默认把
+                # eth1 自己的 192.168.9.1 当作默认网关发给 PC。
+                # 注意：不能写 dhcp-option=3,0.0.0.0——dnsmasq 会把它
+                # 解释成“本机地址”，仍然下发网关。
+                lines += [
+                    "dhcp-option=interface:%s,3" % pc_iface,
+                    "dhcp-option=interface:%s,6,223.5.5.5,119.29.29.29"
+                    % pc_iface,
+                ]
         if h["enabled"] and iface_exists(h["iface"]):
             lines += [
                 "interface=%s" % h["iface"],

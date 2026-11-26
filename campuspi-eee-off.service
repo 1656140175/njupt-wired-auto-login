@@ -1,0 +1,12 @@
+[Unit]
+Description=CampusPi r8152 EEE off and USB power stabilization
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/campuspi-eee-off.sh eth1
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

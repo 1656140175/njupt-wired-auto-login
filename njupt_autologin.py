@@ -11,9 +11,11 @@
 （key=value 格式，# 开头为注释），命令行参数可覆盖。bat 内不硬编码任何信息。
 
 说明：
-  - 账号格式 = 学号 + 运营商后缀（移动 @cmcc / 电信 @njxy / 校园网空）
-  - 登录请求与 a79.htm 页面表单完全一致（POST + 全部字段）
-  - 成功/失败以网关 302 跳转页 Dr.COMWebLoginID_3.htm/_2.htm 判定
+  - 账号格式 = 学号 + 运营商后缀（移动 @cmcc / 电信 @njxy / 联通 @lt / 校园网空）
+  - 2026-11 网关升级：a79.htm 改为调用新版 JSONP 接口
+      GET /eportal/portal/login?...&user_account=,0,<账号>
+    旧路径 /eportal/?c=ACSetting&a=Login 只会返回 EPortal 管理页 HTML。
+  - 成功/失败以返回 JSON 的 result / ret_code 判定（result=1 成功）
 """
 import argparse
 import json
@@ -27,28 +29,34 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-GATEWAY = "http://10.10.244.11:801/eportal/?c=ACSetting&a=Login"
+# 2026-11 南邮网关升级为新版 ePortal：旧路径 /eportal/?c=ACSetting&a=Login
+# 只返回 EPortal 管理页 HTML。真正的登录接口（a79.htm 的 page.portal_api）：
+GATEWAY = "http://10.10.244.11:801/eportal/portal/login"
 # 注意：探测必须用 HTTP 而非 HTTPS！
 # 校园网未认证时 HTTPS 被网关直接阻断（丢包），而 HTTP 会被劫持到认证页
 # （返回 302/认证页特征），据此区分"未认证"和"真断网"。
 HTTP_PROBE = [("http://www.baidu.com/generate_204", "204"),
               ("http://connect.rom.miui.com/generate_204", "204"),
               ("http://www.qq.com/", "腾讯")]
-# 页面 f0 表单的全部字段
-FORM_FIELDS = {"0MKKey": "123456", "R1": "0", "R2": "0", "R3": "0",
-               "R6": "0", "para": "00", "url": "drappall",
-               "buttonClicked": "", "redirect_url": "", "err_flag": "",
-               "username": "", "password": "", "user": "", "cmd": "",
-               "Login": "", "v6ip": ""}
 
 
 def decode(body):
-    for enc in ("gbk", "utf-8"):
+    """先 UTF-8 再 GBK（顺序不能反：UTF-8 中文按 GBK 常能"解码"但乱码）。"""
+    for enc in ("utf-8", "gbk"):
         try:
             return body.decode(enc)
         except UnicodeDecodeError:
             continue
     return body.decode("utf-8", "ignore")
+
+
+def strip_jsonp(text):
+    """去掉 jsonp 回调包装；纯 JSON 也兼容。"""
+    stripped = text.strip()
+    match = re.search(r"^[\w$.\[\]'\" ]*\((\{.*\})\)\s*;?\s*$", stripped, re.S)
+    if match:
+        return json.loads(match.group(1))
+    return json.loads(stripped)
 
 
 CONF_NAME = "njupt_autologin.conf"
@@ -130,12 +138,16 @@ def _link_up(host, port, timeout=3):
 
 def _is_captive(final_url, body):
     """响应是否被网关劫持（未认证特征：跳到认证页 / 返回认证页内容）。
-    端点匹配用 host:port（劫持跳转 URL 必带端口，避免误伤探测 URL 自身）。"""
+    端点匹配用 host:port（劫持跳转 URL 必带端口，避免误伤探测 URL 自身）。
+    南邮实际劫持页也可能是：
+      <script>location.href="http://10.10.244.11/a79.htm"</script>
+    （URL 不变、无 302，必须靠 a79.htm 识别）。"""
     text = (final_url + " " + body).lower()
     host, port = _gateway_hostport()
     endpoint = "%s:%d" % (host, port)
-    return ("eportal" in text or "loginid" in text or endpoint in text
-            or "dr.com" in text or "认证" in text)
+    return ("eportal" in text or "loginid" in text or "a79.htm" in text
+            or "authentication is required" in text
+            or endpoint in text or "dr.com" in text or "认证" in text)
 
 
 def probe_network(timeout=5):
@@ -178,33 +190,97 @@ def gateway_reachable(gateway=None, timeout=3):
     return _socket_reachable(host, port, timeout)
 
 
-def login(username, password, gateway=None, timeout=10):
-    """POST 哆点网关。返回 (ok, 说明)。"""
-    data = {"DDDDD": username, "upass": password}
-    data.update(FORM_FIELDS)
-    m = re.match(r"(https?://[^/]+)", gateway or GATEWAY)
-    referer = (m.group(1) + "/") if m else "http://10.10.244.11:801/"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-               "Accept-Encoding": "identity",
-               "Referer": referer}
-    req = urllib.request.Request(
-        gateway or GATEWAY, data=urllib.parse.urlencode(data).encode("utf-8"),
-        headers=headers, method="POST")
+def _safe_err(exc):
+    """异常脱敏：新版接口密码在 URL 查询串，不能原样写进日志/控制台。"""
     try:
-        with _no_proxy_opener().open(req, timeout=timeout) as resp:
+        if isinstance(exc, urllib.error.HTTPError):
+            return "HTTP %d" % exc.code
+        return re.sub(r"\?[^\s'\"]*", "?…", str(exc))[:200]
+    except Exception:
+        return exc.__class__.__name__
+
+
+def _api_url(gateway=None):
+    """把配置里的网关归一化为新版 JSONP 登录接口。
+    兼容旧配置：http://10.10.244.11:801/eportal/?c=ACSetting&a=Login
+    -> http://10.10.244.11:801/eportal/portal/login
+    """
+    gateway = (gateway or GATEWAY).strip()
+    m = re.match(r"(https?)://([^/]+)(/.*)?$", gateway)
+    if not m:
+        return GATEWAY
+    scheme, hostport, path = m.group(1), m.group(2), m.group(3) or "/"
+    if ("c=ACSetting" in path or path.rstrip("/") == "/eportal"
+            or path == "/"):
+        path = "/eportal/portal/login"
+    return "%s://%s%s" % (scheme, hostport, path)
+
+
+def _local_ip(host, port):
+    """本机到网关的源 IP（UDP connect 只选路、不发包）。"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect((host, int(port)))
+        return sock.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        sock.close()
+
+
+def login(username, password, gateway=None, timeout=10,
+          prefix=",0,", mac="000000000000"):
+    """新版 ePortal JSONP 登录。返回 (ok, 说明)。"""
+    url = _api_url(gateway)
+    host, port = _gateway_hostport(url)
+    ip = _local_ip(host, port)
+    if not ip or ip == "0.0.0.0":
+        return False, "无法确定本机校园网 IP（请确认网线已连接）"
+    params = {
+        "callback": "jsonpReturn",
+        "login_method": "1",
+        "user_account": str(prefix or "") + username,
+        "user_password": password,
+        "wlan_user_ip": ip,
+        "wlan_user_ipv6": "",
+        "wlan_user_mac": (mac or "000000000000").replace(":", "").lower(),
+        "wlan_ac_ip": "",
+        "wlan_ac_name": "",
+        "jsVersion": "4.1.3",
+        "terminal_type": "1",
+        "lang": "zh",
+    }
+    referer = "http://%s:%d/" % (host, port) if host else ""
+    full = url + ("&" if "?" in url else "?") + \
+        urllib.parse.urlencode(params)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+               "Accept-Encoding": "identity", "Referer": referer}
+    try:
+        with _no_proxy_opener().open(
+                urllib.request.Request(full, headers=headers),
+                timeout=timeout) as resp:
             body = decode(resp.read(65536))
-            final_url = resp.geturl()
     except urllib.error.HTTPError as exc:
         return False, "网关错误: HTTP %d" % exc.code
     except Exception as exc:
-        return False, "请求失败: %s" % exc
-    low = (body + " " + final_url).lower()
-    if "webloginid_2" in low or "认证失败" in low or "密码错误" in low \
-            or "fail" in low:
-        return False, "登录失败: %s" % body.replace("\n", " ")[:120]
-    if "webloginid_3" in low or "认证成功" in low or "success" in low:
-        return True, "登录成功"
-    return True, "已发送登录请求（等待探测确认）"
+        return False, "请求失败: %s" % _safe_err(exc)
+    try:
+        obj = strip_jsonp(body)
+    except Exception:
+        preview = body.replace("\n", " ")[:160]
+        if "<title>EPortal</title>" in body \
+                or "/eportal/public/static" in body:
+            return False, "网关返回 EPortal 管理页：登录接口地址可能已变更"
+        return False, "响应无法解析: %s" % preview
+    if not isinstance(obj, dict):
+        return False, "响应格式异常: %s" % body.replace("\n", " ")[:120]
+    if obj.get("result") in (1, "1", "ok", True):
+        return True, "登录成功（新版 ePortal）"
+    ret = obj.get("ret_code")
+    msg = str(obj.get("msg") or obj.get("error") or "").strip()
+    if str(ret) == "2" or "已经在线" in msg:
+        return True, "终端 IP 已在线"
+    return False, "登录失败: %s" % (msg or ("ret_code=%s" % ret))
 
 
 def in_quiet(hour, minute, start, end):
@@ -222,8 +298,12 @@ def main():
                         help="学号（默认读同级 %s）" % CONF_NAME)
     parser.add_argument("--pass", dest="password", default="", help="密码")
     parser.add_argument("--suffix", default="",
-                        help="运营商后缀（移动@cmcc/电信@njxy/校园网空）")
+                        help="运营商后缀（移动@cmcc/电信@njxy/联通@lt，校园网空）")
     parser.add_argument("--gateway", default=GATEWAY, help="网关地址")
+    parser.add_argument("--prefix", default=",0,",
+                        help="账号前缀（PC 端 ,0,；手机端 ,1,）")
+    parser.add_argument("--mac", default="000000000000",
+                        help="wlan_user_mac（默认全 0 即可）")
     parser.add_argument("--probe", default=None,
                         help="自定义探测，格式 URL|标记;URL|标记（分号分隔）")
     parser.add_argument("--watch", action="store_true",
@@ -245,8 +325,9 @@ def main():
     # 同级 njupt_autologin.conf 提供默认值（bat 内不硬编码任何信息）
     conf = load_conf()
     defaults = {}
-    for key in ("user", "password", "suffix", "gateway", "interval",
-                "attempts", "attempt_delay", "quiet_start", "quiet_end"):
+    for key in ("user", "password", "suffix", "gateway", "prefix", "mac",
+                "interval", "attempts", "attempt_delay", "quiet_start",
+                "quiet_end"):
         if key in conf:
             defaults[key] = int(conf[key]) if key in (
                 "interval", "attempts", "attempt_delay") else conf[key]
@@ -304,9 +385,15 @@ def main():
                       % (time.strftime("%H:%M:%S"), i, args.attempt_delay))
                 time.sleep(args.attempt_delay)
             print("[%s] 尝试登录 %s" % (time.strftime("%H:%M:%S"), username))
-            ok, msg2 = login(username, args.password, args.gateway)
+            ok, msg2 = login(username, args.password, args.gateway,
+                             prefix=args.prefix, mac=args.mac)
             print("[%s] 登录: %s" % (time.strftime("%H:%M:%S"), msg2))
             if ok:
+                break
+            # 账号/密码/运营商错误是确定性的，重试只会触发网关风控
+            if ("账号" in msg2 or "密码" in msg2 or "运营商" in msg2):
+                print("[%s] 账号或运营商错误，停止重试；"
+                      "请检查 suffix 配置" % time.strftime("%H:%M:%S"))
                 break
         return ok, msg2
 

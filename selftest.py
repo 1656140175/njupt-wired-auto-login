@@ -40,10 +40,14 @@ def test_config():
     tmp = os.path.join(tempfile.mkdtemp(), "config.json")
     c = config_mod.Config(tmp)
     check("默认适配器为南邮哆点 drcom", c.data["campus"]["adapter"] == "drcom")
-    check("哆点参数与 a79.htm 一致",
+    check("哆点默认走新版 ePortal JSONP 接口",
           c.data["drcom"]["host"] == "10.10.244.11"
           and c.data["drcom"]["port"] == 801
-          and c.data["drcom"]["path"] == "/eportal/?c=ACSetting&a=Login"
+          and c.data["drcom"]["api_path"] == "/eportal/portal/login"
+          and c.data["drcom"]["api_logout_path"] == "/eportal/portal/logout"
+          and c.data["drcom"]["account_prefix"] == ",0,")
+    check("旧版表单回退参数保留",
+          c.data["drcom"]["path"] == "/eportal/?c=ACSetting&a=Login"
           and c.data["drcom"]["user_field"] == "DDDDD"
           and c.data["drcom"]["pass_field"] == "upass"
           and c.data["drcom"]["success_keys"][0] == "webloginid_3")
@@ -140,52 +144,101 @@ def test_eportal():
 
 # -------------------------------------------------------------- drcom
 def test_drcom():
-    import urllib.parse
     p = Portal(None)
+    p.local_ip = lambda *a: "10.1.2.3"       # Windows 上没有 ip 命令
     cfg = deep_merge(config_mod.DEFAULTS, {
         "campus": {"adapter": "drcom", "username": "B23010101",
                    "password": "pw123", "isp": "telecom"},
         "drcom": {"host": "10.10.244.11", "port": 801}})
     captured = {}
 
-    def fake(base, params=None, data=None, timeout=8):
-        captured["url"] = base
-        captured["data"] = urllib.parse.urlencode(data) if data else ""
-        return ("ok", "http://10.10.244.11/")
-    p._fetch_resp = fake
+    def fake_fetch(url, params=None, data=None, timeout=8):
+        captured["url"] = url
+        captured["params"] = params or {}
+        return 'jsonpReturn({"result":1,"msg":"\\u767b\\u5f55\\u6210\\u529f"});'
+    p._fetch = fake_fetch
     ok, msg = p._drcom_login(cfg)
-    check("drcom 登录成功(POST)", ok, msg)
-    check("POST 到 801 网关路径", captured["url"] ==
-          "http://10.10.244.11:801/eportal/?c=ACSetting&a=Login",
-          captured["url"])
-    check("POST 数据含 DDDDD 账号+后缀", "DDDDD=B23010101%40njxy" in captured["data"],
-          captured["data"][:150])
-    check("POST 数据含 upass 明文密码", "upass=pw123" in captured["data"])
-    check("POST 数据含附加参数", "0MKKey=123456" in captured["data"]
-          and "url=drappall" in captured["data"])
-    check("POST 数据含空值字段", "buttonClicked=" in captured["data"]
-          and "v6ip=" in captured["data"])
-    # 302 到成功页判定
+    check("新版 ePortal 登录成功", ok, msg)
+    check("新版接口路径", captured["url"].endswith("/eportal/portal/login"),
+          captured.get("url"))
+    check("账号带 ,0, 前缀和后缀",
+          captured["params"].get("user_account") == ",0,B23010101@njxy",
+          captured["params"].get("user_account"))
+    check("密码明文参数", captured["params"].get("user_password") == "pw123")
+    check("wlan_user_ip 参数", captured["params"].get("wlan_user_ip") == "10.1.2.3")
+    check("jsVersion 参数", captured["params"].get("jsVersion") == "4.1.3")
+    # 账号/运营商错误
+    p._fetch = lambda *a, **k: (
+        'jsonpReturn({"result":0,"ret_code":1,'
+        '"msg":"账号错误(运营商登录请检查输入的账号和绑定的运营商账号是否有误)"});')
+    ok, msg = p._drcom_login(cfg)
+    check("账号错误判失败并透传 msg", (not ok) and "账号错误" in msg, msg)
+    check("last_ret_code=1", p.last_ret_code == 1, p.last_ret_code)
+    # 终端已在线
+    p._fetch = lambda *a, **k: (
+        'jsonpReturn({"result":0,"ret_code":2,"msg":"终端IP已经在线"})')
+    ok, msg = p._drcom_login(cfg)
+    check("终端已在线视为成功", ok and "在线" in msg, msg)
+    # 新版路径返回管理页 HTML：必须明确报错，不能当成功
+    p._fetch = lambda *a, **k: (
+        '<!DOCTYPE html><html><head><title>EPortal</title></head></html>')
+    ok, msg = p._drcom_login(cfg)
+    check("EPortal 管理页提示接口变更",
+          (not ok) and "管理页" in msg, msg)
+    # 非 JSON -> 回退旧版表单
+    p._fetch = lambda *a, **k: "not json"
     p._fetch_resp = lambda *a, **k: ("", "http://x/Dr.COMWebLoginID_3.htm")
     ok, msg = p._drcom_login(cfg)
-    check("跳转 3.htm 判成功", ok, msg)
-    # 302 到失败页判定
+    check("新版异常回退旧版成功", ok, msg)
     p._fetch_resp = lambda *a, **k: ("", "http://x/Dr.COMWebLoginID_2.htm")
     ok, msg = p._drcom_login(cfg)
-    check("跳转 2.htm 判失败", not ok and "失败" in msg, msg)
-    # 响应正文错误关键字
+    check("旧版回退失败判定", not ok and "失败" in msg, msg)
     p._fetch_resp = lambda *a, **k: ("密码错误，请重试", "http://x/")
     ok, msg = p._drcom_login(cfg)
-    check("正文错误关键字判失败", not ok, msg)
-    # 注销
+    check("旧版正文错误关键字判失败", not ok, msg)
+    # 无 IP
+    p.local_ip = lambda *a: "0.0.0.0"
+    ok, msg = p._drcom_login(cfg)
+    check("无 IP 返回明确提示", not ok and "无 IP" in msg, msg)
+    # 注销：新版
+    p.local_ip = lambda *a: "10.1.2.3"
     p._last_url = None
     def capture(url, params=None, data=None, timeout=8):
         p._last_url = url
-        return ("", "http://x/")
-    p._fetch_resp = capture
+        return 'jsonpReturn({"result":1,"msg":"注销成功"});'
+    p._fetch = capture
     ok, msg = p.logout(cfg)
-    check("注销成功", ok and "注销请求已发送" in msg, msg)
-    check("注销路径正确", "a=Logout&ver=1.0" in p._last_url, p._last_url)
+    check("新版注销成功", ok and "注销成功" in msg, msg)
+    check("新版注销路径", p._last_url.endswith("/eportal/portal/logout"),
+          p._last_url)
+    # 注销回退
+    p._fetch = lambda *a, **k: "not json"
+    p._fetch_resp = lambda *a, **k: ("", "http://x/")
+    ok, msg = p.logout(cfg)
+    check("注销回退旧版", ok and "已发送" in msg, msg)
+
+
+# ----------------------------------------------------- 安全/探测辅助
+def test_helpers():
+    import urllib.error
+    p = Portal(None)
+    cfg = deep_merge(config_mod.DEFAULTS, {})
+    check("识别 a79.htm JS 劫持页",
+          p._is_captive("http://www.qq.com/",
+                        '<script>location.href="http://10.10.244.11/a79.htm"'
+                        "</script>", cfg))
+    check("正常页面不误判",
+          not p._is_captive("http://www.qq.com/", "<html>hello</html>", cfg))
+    err = urllib.error.HTTPError(
+        "http://x/eportal/portal/login?user_password=secret", 500,
+        "err", {}, None)
+    check("HTTPError 日志不含密码", "secret" not in Portal._safe_err(err))
+
+    class E(Exception):
+        pass
+    text = Portal._safe_err(
+        E("failed http://x/eportal/portal/login?user_password=secret"))
+    check("普通异常日志不含密码", "secret" not in text, text)
 
 
 # --------------------------------------------------------------- IP/子网
@@ -240,6 +293,14 @@ def test_app_save():
     # 状态接口在 Windows 上也不应崩溃
     st = app.status()
     check("status() 可用", isinstance(st, dict) and "online" in st)
+    check("status 含 RDP 状态",
+          isinstance(st.get("rdp"), dict) and "installed" in st["rdp"])
+    check("status 含延迟优化状态", isinstance(st.get("tuning"), dict))
+    rdp_text = app.rdp_file_text("192.168.9.1")
+    check("RDP 文件含连接地址",
+          "full address:s:192.168.9.1:3389" in rdp_text)
+    check("RDP 文件要求输入密码",
+          "prompt for credentials:i:1" in rdp_text)
     # 静默时段判断（时间可信时）
     app.config.data["quiet_hours"]["enabled"] = True
     check("quiet_hours_active() 可调用",
@@ -252,6 +313,7 @@ def main():
     test_drcom()
     test_eportal()
     test_srun()
+    test_helpers()
     test_ip()
     test_app_save()
     print("\n%d 通过, %d 失败" % (PASS, FAIL))

@@ -1,6 +1,6 @@
 @echo off
 rem ============================================================
-rem  Allow LAN access from the CampusPi hotspot subnet.
+rem  Allow LAN access from the CampusPi hotspot and PC-facing subnets.
 rem
 rem  Why this is needed:
 rem    Windows treats the USB NIC (to the Raspberry Pi) as a
@@ -34,7 +34,7 @@ echo ============================================================
 echo  Current network profiles:
 powershell -NoProfile -Command "Get-NetConnectionProfile | Select-Object InterfaceAlias,NetworkCategory | Format-Table -AutoSize"
 echo.
-echo  1) Add firewall rule for 192.168.10.0/24  (recommended)
+echo  1) Add firewall rules for 192.168.10.0/24 and 192.168.9.0/24  (recommended)
 echo  2) Set the USB NIC network to Private
 echo  3) Do both 1 and 2
 echo  4) Remove everything this script added
@@ -66,7 +66,10 @@ netsh advfirewall firewall add rule name="CampusPi Hotspot LAN" ^
 netsh advfirewall firewall delete rule name="CampusPi Hotspot ICMP" >nul 2>nul
 netsh advfirewall firewall add rule name="CampusPi Hotspot ICMP" ^
   dir=in action=allow protocol=icmpv4:8,any remoteip=192.168.10.0/24 profile=any
-echo  [OK] Firewall rules added
+netsh advfirewall firewall delete rule name="CampusPi PC LAN" >nul 2>nul
+netsh advfirewall firewall add rule name="CampusPi PC LAN" ^
+  dir=in action=allow protocol=any remoteip=192.168.9.0/24 profile=any
+echo  [OK] Firewall rules added (192.168.10.0/24, 192.168.9.0/24)
 exit /b
 
 :setprivate
@@ -81,6 +84,7 @@ echo.
 echo  Removing firewall rules...
 netsh advfirewall firewall delete rule name="CampusPi Hotspot LAN" >nul 2>nul
 netsh advfirewall firewall delete rule name="CampusPi Hotspot ICMP" >nul 2>nul
+netsh advfirewall firewall delete rule name="CampusPi PC LAN" >nul 2>nul
 echo  [OK] Firewall rules removed
 echo  (Network profile left unchanged - set it back in Settings if needed)
 goto end

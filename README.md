@@ -106,6 +106,30 @@ sudo bash install.sh
 #    http://192.168.9.1:8080   （电脑插 USB 网线后访问）
 ```
 
+### 最省事：只传一个文件
+
+`release/campuspi-onefile-install.sh` 是自解压的单文件安装包，内嵌了
+`campuspi-pi.zip`。把它传到树莓派后执行：
+
+```bash
+sudo bash campuspi-onefile-install.sh
+```
+
+它会依次完成：安装依赖 → 部署主程序并注册服务 → 安装/启动 RDP →
+应用转发延迟优化 → 启动服务 → **用现有账号真实登录一次验证自动连接**。
+已有的 `/etc/campuspi/config.json` **不会被覆盖**，账号密码和运营商配置保留。
+
+- 不想装 RDP：`WITH_RDP=0 sudo bash campuspi-onefile-install.sh`
+- 只解压检查（不改系统）：`DRY_RUN=1 bash campuspi-onefile-install.sh`
+
+部署完成后验证自动连接：
+
+```bash
+sudo python3 /opt/campuspi/main.py --check-login
+```
+
+会用当前配置里的账号真实登录一次，并打印网关返回的结果。
+
 `install.sh` 会自动完成：国内镜像源 → 安装 hostapd/dnsmasq/iptables/iw → 时区校时 → 部署到 `/opt/campuspi` → 注册 systemd 服务 → 自检。
 
 ### 特性
@@ -117,6 +141,8 @@ sudo bash install.sh
 | 无 RTC 保护 | 树莓派断电后时间归零，此时**不启用静默**，避免永远不重连 |
 | 强制门户自动跳转 | 校园网离线时，电脑插线后 **Windows 自动弹出配置页**（dnsmasq 劫持探测域名 + `nla.py`） |
 | USB 网线自愈 | 拔插 USB 网卡导致 IP 丢失时，自动重新配置（约 5 秒恢复） |
+| 远程桌面 | Web 后台一键装 xrdp，Windows 远程桌面直连；仅 PC/热点子网可访问 |
+| 延迟优化 | 一键应用 fq_codel / RPS / performance / 关闭 EEE，开机自动保持 |
 | Web 后台 | 账号/运营商/热点/静默时段全在网页配置，密码字段脱敏 |
 
 ### Web 后台
@@ -129,6 +155,38 @@ sudo bash install.sh
 - **静默时段**：起止时间，支持跨午夜
 - **Web 后台**：管理密码（设置后所有接口需 Basic 认证）
 
+### 远程桌面（RDP）与延迟优化
+
+Web 后台新增两个一键功能：
+
+- **🖥 远程桌面（RDP）**：一键安装/启动 `xrdp`。首次安装需要树莓派能上网
+  （apt 装 xrdp；没有桌面环境时装轻量 XFCE，约 1-3 分钟）。
+  完成后点「下载 .rdp 连接文件」，Windows 双击即可用系统自带的
+  “远程桌面连接”打开；也可以直接运行 `mstsc /v:192.168.9.1`。
+  登录用**树莓派的系统账号/密码**（不是 Web 后台密码）。
+  3389 只允许 `192.168.9.0/24` 和 `192.168.10.0/24` 访问，校园网侧
+  直接 DROP；`campuspi-rdp-firewall.service` 开机自动重建规则。
+- **⚡ 转发延迟优化**：一键应用 `fq_codel`、RPS/RFS、CPU performance、
+  关闭网卡 EEE 与 Wi-Fi 省电；`campuspi-tuning.service` 开机自动重新应用。
+  会略增功耗/温度，请做好散热。RDP 是 PC 直连树莓派，不经过校园网转发，
+  本身延迟很低。
+- **🛠 桌面/任务栏修复**：本地桌面或 RDP 桌面没有任务栏时，一键修复
+  LXDE（lxpanel）/XFCE（xfce4-panel）/Wayland（wf-panel-pi）：
+  缺包自动安装、面板配置/自启动缺失或损坏时先备份再恢复默认，
+  并在当前 X11 会话里重启任务栏。Wayland 需注销/重启，RDP 需断开重连。
+  「深度重置」会重置用户面板布局。
+
+命令行等价操作：
+
+```bash
+sudo bash /opt/campuspi/setup_rdp.sh        # 安装/启动 RDP
+sudo bash /opt/campuspi/setup_tuning.sh     # 延迟优化
+sudo bash /opt/campuspi/repair_desktop.sh   # 修复任务栏
+RESET_PANEL=1 sudo bash /opt/campuspi/repair_desktop.sh  # 深度重置面板
+```
+
+> RDP 只建议在内网使用；树莓派账号请设置强密码，Web 后台也建议设置管理密码。
+
 ### 常用命令
 
 ```bash
@@ -136,24 +194,47 @@ journalctl -u campuspi -f              # 实时日志
 tail -f /var/log/campuspi.log          # 日志文件
 sudo systemctl restart campuspi        # 重启服务
 curl -X POST http://192.168.9.1:8080/api/action/login   # 手动触发登录
+
+# 查看本网络登录页实际提供的运营商后缀（排查"账号错误"）
+curl -s http://10.10.244.11/a79.htm | iconv -f gb18030 -t utf-8 \
+  | grep -o "carrier='.*'"
 ```
 
 ---
 
-## 认证协议（南邮：哆点 Dr.COM eportal 4.3）
+## 认证协议（南邮：哆点 Dr.COM 新版 ePortal，2026-11 起）
 
-南邮门户 `p.njupt.edu.cn/a79.htm` 使用哆点 Dr.COM，登录为单步 POST：
+南邮网关已升级。`p.njupt.edu.cn/a79.htm` 的 `page.portal_api` 为
+`/eportal/portal/`，登录是单步 JSONP（GET）：
 
 ```
-POST http://10.10.244.11:801/eportal/?c=ACSetting&a=Login
-     DDDDD=<学号+运营商后缀>&upass=<密码>&0MKKey=123456&...
+GET http://10.10.244.11:801/eportal/portal/login
+    ?callback=jsonpReturn&login_method=1
+    &user_account=,0,<学号+运营商后缀>
+    &user_password=<密码>
+    &wlan_user_ip=<本机校园网 IP>&wlan_user_mac=<MAC>
+    &wlan_ac_ip=&wlan_ac_name=&jsVersion=4.1.3
+    &terminal_type=1&lang=zh
 ```
 
-- 直连网关 IP（绕过 DNS），端口 801，HTTP 明文
-- 参数名 `DDDDD` / `upass`、路径、附加字段均可在 Web 后台修改
-- 成功/失败判定：302 跳转页 **`Dr.COMWebLoginID_3.htm` = 成功 / `_2.htm` = 失败**
-- **运营商 = 账号后缀**：校园网无后缀 / 移动 `@cmcc` / 电信 `@njxy`
-  （后缀填错会得到"**未绑定运营商账号**"错误）
+返回 `jsonpReturn({...})`：
+
+- `result=1`（或 `ok`）= 成功
+- `result=0` 时看 `ret_code`：`1/4` 账号或运营商错误、`2` 终端已在线、
+  `7` Radius 认证失败……
+- 失败时 `msg` 是网关的原始中文提示，日志里会原样显示
+
+要点：
+
+- 旧路径 `/eportal/?c=ACSetting&a=Login` **已经不在处理登录**，现在只会
+  返回 EPortal 管理页 HTML（这也是旧版代码日志里出现 `<title>EPortal</title>`
+  的原因）；代码保留它仅作旧网关回退。
+- 直连网关 IP（绕过 DNS），端口 801，HTTP 明文；Web 后台可改。
+- 账号前缀 `,0,` 是 PC 端；手机/平板是 `,1,`。
+- **运营商 = 账号后缀**：校园网无后缀 / 移动 `@cmcc` / 电信 `@njxy` /
+  联通 `@lt`（不同入口的登录页给出的后缀可能不同，以实际登录页为准）。
+  后缀填错会得到"**账号错误(运营商登录请检查输入的账号和绑定的运营商
+  账号是否有误)**"。
 
 > 代码内置 **4 种认证适配器**，换学校也能用：
 > - `drcom`（默认）：哆点 Dr.COM
@@ -179,12 +260,17 @@ ping 通 + 外网可访问     → online       （已认证，什么都不做�
 
 | 现象 | 处理 |
 |---|---|
-| 提示"未绑定运营商账号" | 运营商后缀选错。移动 `@cmcc`、电信 `@njxy`、校园网留空 |
+| 日志出现 `<title>EPortal</title>` / 返回管理页 HTML | 网关已升级，旧登录接口失效。更新到 v1.1.0+（新版 `/eportal/portal/login`） |
+| 提示"账号错误(运营商登录请检查输入的账号和绑定的运营商账号是否有误)" | 账号/密码错，或运营商后缀不对。打开 `http://10.10.244.11/a79.htm` 看页面实际给出的运营商后缀再选 |
+| 提示"未绑定运营商账号" | 运营商后缀选错。移动 `@cmcc`、电信 `@njxy`、联通 `@lt`、校园网留空（以 a79.htm 实际显示为准） |
+| 提示"认证出现异常！" `ret_code=1`，且 a79.htm 全部显示"无后缀" | 网关当前不要求后缀。把 Web 后台运营商改为"校园用户/无后缀"，账号只填学号；新版代码检测到全部无后缀时会自动忽略本地配置的 `@cmcc` 等后缀 |
 | 提示 `AC999` | AC 侧认证失败。常见原因：欠费、短时间内频繁尝试触发风控、密码错误。**停掉所有重试冷却 30 分钟**，再用浏览器手动登录一次验证；多校文档反馈"改密码"能解决多数情况 |
 | `'xxx' is not recognized` | bat 编码问题。本项目所有 bat 为**纯 ASCII**（中文由 Python 输出），若出现说明文件被 UTF-8 保存过，重新拷贝即可 |
 | 热点起不来 | `journalctl -u hostapd -e`；确认网卡支持 AP 模式（`iw list` 看 Supported interface modes） |
 | 手机连不上热点 | 信道别用 12/13（国内手机不支持），用 1/6/11 |
 | 拔插 USB 网线后打不开管理页 | 新版本已自愈（约 5 秒）。若仍不行：`ipconfig /renew` 或在树莓派上 `sudo systemctl restart campuspi` |
+| 插着树莓派时 Wi-Fi 能连但上不了网 | 默认只在校园网在线时把 `192.168.9.1` 设为 PC 的网关/DNS；离线时不下发默认网关，DNS 改为 `223.5.5.5,119.29.29.29`。执行一次 `ipconfig /renew` 即可走 Wi-Fi。需要旧行为时在 `/etc/campuspi/config.json` 的 `pc` 段设置 `"share_online_only": false` |
+| 离线时想看树莓派状态 | 直接访问 `http://192.168.9.1:8080`。这是 `192.168.9.0/24` 直连路由，不依赖默认网关或 DNS；后台设置密码时用该密码登录 |
 | 手机访问不到电脑 | 在 Windows 上以管理员运行 `njupt_allow_hotspot_lan.bat` 放行热点网段 |
 
 ---
@@ -205,8 +291,13 @@ config.py                 配置加载保存（/etc/campuspi/config.json）
 portal.py                 认证适配器（drcom / eportal / srun / generic）
 network.py                接口探测、静态 IP、NAT、客户端互通
 hotspot.py                hostapd + dnsmasq 配置生成与守护
-webui.py + web/index.html Web 管理后台
+webui.py + web/index.html Web 管理后台（含 RDP/延迟优化一键按钮）
 nla.py                    强制门户：离线时让 Windows 自动弹配置页
+setup_rdp.sh              一键安装/启动 xrdp 远程桌面
+setup_tuning.sh           一键转发延迟优化（fq_codel/RPS/performance）
+repair_desktop.sh         一键修复任务栏（LXDE/XFCE/Wayland）
+deploy_all.sh             全自动部署编排（install + RDP + 延迟优化）
+connect_pi_rdp.bat        Windows 一键打开树莓派远程桌面
 selftest.py               自检（Windows 上也能跑）
 
 【旧版 Windows 助手】

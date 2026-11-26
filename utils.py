@@ -43,7 +43,12 @@ def carrier(name):
 
 
 def get_ip(name):
-    """获取接口当前 IPv4 地址；无则 None。"""
+    """获取接口当前可用 IPv4 地址；无则 None。
+
+    忽略 169.254.x.x 链路本地地址：接口在 DHCP 还没拿到租约时经常先挂一个
+    link-local 地址，如果把它当成本机 IP，登录接口的 wlan_user_ip 就错了
+    （表现为"账号错误"或认证失败），而且 ensure_dhcp 会误以为 DHCP 已成功
+    而不再重试。"""
     proc = run(["ip", "-4", "-o", "addr", "show", "dev", name])
     if not proc or proc.returncode != 0:
         return None
@@ -51,10 +56,23 @@ def get_ip(name):
         parts = line.split()
         try:
             idx = parts.index("inet")
-            return parts[idx + 1].split("/")[0]
+            addr = parts[idx + 1].split("/")[0]
         except (ValueError, IndexError):
             continue
+        if addr.startswith("169.254."):
+            continue
+        return addr
     return None
+
+
+def get_mac(name):
+    """获取接口 MAC（小写、无冒号）；接口不存在/读取失败返回空串。
+    新版 ePortal 登录的 wlan_user_mac 参数要用。"""
+    try:
+        with open(os.path.join("/sys/class/net", name, "address"), "r") as f:
+            return f.read().strip().replace(":", "").lower()
+    except OSError:
+        return ""
 
 
 def wait_for_ip(name, timeout=30):

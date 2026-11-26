@@ -170,6 +170,10 @@ install -m 0644 "$SRC_DIR/main.py" "$SRC_DIR/config.py" "$SRC_DIR/utils.py" \
   "$SRC_DIR/portal.py" "$SRC_DIR/network.py" "$SRC_DIR/hotspot.py" \
   "$SRC_DIR/webui.py" "$SRC_DIR/nla.py" "$SRC_DIR/selftest.py" "$APP_DIR/"
 install -m 0644 "$SRC_DIR/web/index.html" "$APP_DIR/web/"
+# 一键脚本（Web 后台按钮调用）
+install -m 0755 "$SRC_DIR/setup_rdp.sh" "$APP_DIR/"
+install -m 0755 "$SRC_DIR/setup_tuning.sh" "$APP_DIR/"
+install -m 0755 "$SRC_DIR/repair_desktop.sh" "$APP_DIR/"
 
 echo "==> 安装 systemd 服务（开机自启）"
 install -m 0644 "$SRC_DIR/campuspi.service" /etc/systemd/system/campuspi.service
@@ -191,7 +195,8 @@ echo "========================================"
 IP=$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
 echo "  1) 浏览器打开 http://${IP:-<树莓派eth0 IP>}:8080"
 echo "     （Windows 电脑插上 USB 网卡线后可访问 http://192.168.9.1:8080）"
-echo "  2) 填写校园网账号/密码、选择运营商（校园用户/移动@cmcc/电信@njxy），保存"
+echo "  2) 填写校园网账号/密码、选择运营商（校园用户/移动@cmcc/电信@njxy/联通@lt，"
+echo "     以后缀以 a79.htm 登录页实际显示为准），保存"
 echo "  3) 设置热点 SSID 和密码，保存"
 echo "  日志: journalctl -u campuspi -f  或  /var/log/campuspi.log"
 echo "  卸载/重装: sudo systemctl disable --now campuspi"

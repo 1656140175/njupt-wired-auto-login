@@ -2,6 +2,7 @@
 """网络接口管理：USB 网卡探测、静态 IP、DHCP、NAT 转发。"""
 import logging
 import os
+import shutil
 import time
 
 from utils import (run, iface_exists, carrier, set_static_ip, get_ip,
@@ -15,6 +16,7 @@ class Network:
         self.app = app
         self._pc_iface = None
         self._pc_scan_ts = 0.0
+        self._pc_logged = None
         self._detect_cache = None
         self._detect_ts = 0.0
 
@@ -61,8 +63,14 @@ class Network:
                     if name != self.campus_iface:
                         self._pc_iface = name
                         break
-        if self._pc_iface:
-            log.info("PC 有线接口: %s", self._pc_iface)
+        # pc_watch 每 2 秒清缓存重新探测；只在结果变化时打日志，
+        # 否则日志会被 "PC 有线接口: eth1" 刷屏（还会增加 SD 卡写入）。
+        if self._pc_iface != self._pc_logged:
+            if self._pc_iface:
+                log.info("PC 有线接口: %s", self._pc_iface)
+            elif self._pc_logged:
+                log.info("PC 有线接口已断开")
+            self._pc_logged = self._pc_iface
         return self._pc_iface
 
     # ------------------------------------------------------------------ 检测
@@ -179,5 +187,48 @@ class Network:
                                     "-j", "ACCEPT"])
         if len(client_ifaces) >= 2:
             log.info("客户端互通规则已就绪（%s）", " <-> ".join(client_ifaces))
+        self.ensure_rdp_firewall()
         log.info("NAT 规则已就绪（%s -> %s）", ",".join(client_ifaces) or "无",
                  campus)
+
+    def ensure_rdp_firewall(self):
+        """RDP(3389) 只允许 PC 有线 / 热点子网，绝不暴露到校园网。
+
+        幂等：由 ensure_nat() 周期调用（30 秒一次），即使接口/配置变化也
+        能在下一轮补齐。setup_rdp.sh 里也有同样一份规则，确保安装完成
+        到下一轮周期之间没有裸露窗口。
+        """
+        cfg = self.app.config.data
+        subnets = []
+        for section in ("pc", "hotspot"):
+            subnet = str((cfg.get(section) or {}).get("subnet") or "").strip()
+            if subnet and subnet not in subnets:
+                subnets.append(subnet)
+        chain = "CAMPUSPI-RDP"
+        run(["iptables", "-N", chain], timeout=5)      # 已存在会失败，忽略
+        for subnet in subnets:
+            check = run(["iptables", "-C", chain, "-p", "tcp", "--dport",
+                         "3389", "-s", subnet, "-j", "ACCEPT"], timeout=5)
+            if check is None or check.returncode != 0:
+                run(["iptables", "-A", chain, "-p", "tcp", "--dport", "3389",
+                     "-s", subnet, "-j", "ACCEPT"], timeout=5)
+        check = run(["iptables", "-C", chain, "-j", "DROP"], timeout=5)
+        if check is None or check.returncode != 0:
+            run(["iptables", "-A", chain, "-j", "DROP"], timeout=5)
+        check = run(["iptables", "-C", "INPUT", "-p", "tcp", "--dport",
+                     "3389", "-j", chain], timeout=5)
+        if check is None or check.returncode != 0:
+            run(["iptables", "-I", "INPUT", "1", "-p", "tcp", "--dport",
+                 "3389", "-j", chain], timeout=5)
+        # IPv6 也封死：xrdp 同时监听 v6，PC/热点用 IPv4 访问即可
+        if shutil.which("ip6tables"):
+            chain6 = "CAMPUSPI-RDP6"
+            run(["ip6tables", "-N", chain6], timeout=5)
+            check = run(["ip6tables", "-C", chain6, "-j", "DROP"], timeout=5)
+            if check is None or check.returncode != 0:
+                run(["ip6tables", "-A", chain6, "-j", "DROP"], timeout=5)
+            check = run(["ip6tables", "-C", "INPUT", "-p", "tcp", "--dport",
+                         "3389", "-j", chain6], timeout=5)
+            if check is None or check.returncode != 0:
+                run(["ip6tables", "-I", "INPUT", "1", "-p", "tcp", "--dport",
+                     "3389", "-j", chain6], timeout=5)

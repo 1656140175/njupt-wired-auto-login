@@ -29,13 +29,16 @@ def make_handler(app):
             log.debug("web: " + fmt, *args)
 
         # ------------------------------------------------------------ 基础
-        def _send(self, code, body=b"", ctype="application/json; charset=utf-8"):
+        def _send(self, code, body=b"", ctype="application/json; charset=utf-8",
+                  extra=None):
             if isinstance(body, str):
                 body = body.encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            for key, value in (extra or {}).items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
 
@@ -107,6 +110,49 @@ def make_handler(app):
                     lines = 300
                 self._send(200, json.dumps({"lines": app.tail_logs(lines)},
                                            ensure_ascii=False))
+            elif path == "/api/rdp/file":
+                if not self._require_auth():
+                    return
+                # 用访问 Web 后台的同一个 IP 作为 RDP 地址（PC/hotspot 均可）
+                host = (self.headers.get("Host") or "").split(":")[0].strip()
+                if not host:
+                    host = app.config.data["pc"]["gateway"]
+                body = app.rdp_file_text(host).encode("utf-8")
+                self._send(200, body, "application/x-rdp; charset=utf-8",
+                           {"Content-Disposition":
+                            'attachment; filename="CampusPi.rdp"'})
+            elif path == "/api/rdp/log":
+                if not self._require_auth():
+                    return
+                try:
+                    lines = min(int(self._query().get("lines", ["120"])[0]),
+                                500)
+                except ValueError:
+                    lines = 120
+                try:
+                    with open("/var/log/campuspi-rdp.log", "r",
+                              encoding="utf-8", errors="replace") as fh:
+                        text = "".join(fh.readlines()[-lines:])
+                except OSError:
+                    text = "（暂无 RDP 安装日志）"
+                self._send(200, json.dumps({"lines": text},
+                                           ensure_ascii=False))
+            elif path == "/api/desktop/log":
+                if not self._require_auth():
+                    return
+                try:
+                    lines = min(int(self._query().get("lines", ["120"])[0]),
+                                500)
+                except ValueError:
+                    lines = 120
+                try:
+                    with open("/var/log/campuspi-desktop-repair.log", "r",
+                              encoding="utf-8", errors="replace") as fh:
+                        text = "".join(fh.readlines()[-lines:])
+                except OSError:
+                    text = "（暂无桌面修复日志）"
+                self._send(200, json.dumps({"lines": text},
+                                           ensure_ascii=False))
             else:
                 self._send(404, json.dumps({"error": "not found"},
                                            ensure_ascii=False))
@@ -147,6 +193,26 @@ def make_handler(app):
                 if not self._require_auth():
                     return
                 ok, msg = app.portal.logout()
+                self._send(200, json.dumps({"ok": ok, "msg": msg},
+                                           ensure_ascii=False))
+            elif path == "/api/action/setup_rdp":
+                if not self._require_auth():
+                    return
+                ok, msg = app.setup_rdp()
+                self._send(200, json.dumps({"ok": ok, "msg": msg},
+                                           ensure_ascii=False))
+            elif path == "/api/action/tune_latency":
+                if not self._require_auth():
+                    return
+                ok, msg = app.tune_latency()
+                self._send(200, json.dumps({"ok": ok, "msg": msg},
+                                           ensure_ascii=False))
+            elif path == "/api/action/repair_desktop":
+                if not self._require_auth():
+                    return
+                data = self._read_json() or {}
+                reset = bool(data.get("reset"))
+                ok, msg = app.repair_desktop(reset=reset)
                 self._send(200, json.dumps({"ok": ok, "msg": msg},
                                            ensure_ascii=False))
             else:

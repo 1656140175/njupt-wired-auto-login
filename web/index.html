@@ -86,12 +86,19 @@
         <input id="d_host" placeholder="10.10.244.11"></div>
       <div class="row"><label>端口</label>
         <input id="d_port" type="number" placeholder="801"></div>
-      <div class="row"><label>登录路径</label>
+      <div class="row"><label>新版登录接口</label>
+        <input id="d_api_path" placeholder="/eportal/portal/login"></div>
+      <div class="row"><label>新版注销接口</label>
+        <input id="d_api_logout_path" placeholder="/eportal/portal/logout"></div>
+      <div class="row"><label>账号前缀</label>
+        <input id="d_prefix" placeholder=",0,"></div>
+      <div class="row"><label>旧版登录路径（回退用）</label>
         <input id="d_path" placeholder="/eportal/?c=ACSetting&a=Login"></div>
-      <div class="row"><label>附加参数(JSON)</label>
+      <div class="row"><label>旧版附加参数(JSON)</label>
         <input id="d_extra" placeholder='{"0MKKey":"123456"}'></div>
-      <div class="hint">南邮 a79.htm 页面参数：DDDDD=账号、upass=密码（明文），
-        成功/失败判定看跳转页 Dr.COMWebLoginID_3.htm / _2.htm。</div>
+      <div class="hint">2026-11 南邮网关已升级：a79.htm 实际调用 JSONP 接口
+        /eportal/portal/login（user_account=,0,账号+运营商后缀）。
+        旧路径现在只返回管理页，仅在新版接口不可用时自动回退。</div>
     </div>
     <div id="eportalBox" style="display:none">
       <div class="row"><label>eportal 网关地址</label>
@@ -100,8 +107,8 @@
         <input id="e_port" type="number" placeholder="801"></div>
       <div class="row"><label>路径</label>
         <input id="e_path" placeholder="/eportal/portal/login"></div>
-      <div class="hint">南邮：GET 单步登录，运营商=账号后缀
-        （校园网无后缀 / 移动 @cmcc / 电信 @njxy），登录后以在线探测为准。</div>
+      <div class="hint">锐捷 eportal 备用适配器（南邮请选 drcom）。
+        运营商 = 账号后缀，登录后以在线探测为准。</div>
     </div>
     <div class="row"><label>认证服务器地址</label>
       <input id="c_host" placeholder="p.njupt.edu.cn"></div>
@@ -170,6 +177,61 @@
       <input id="p_delay" type="number" min="1" max="300"></div>
     <div class="hint">Windows 电脑网卡设为自动获取 IP 即可，
       登录后台地址：<b>http://192.168.9.1:8080</b></div>
+  </section>
+
+  <section>
+    <h2>🖥 远程桌面（RDP）</h2>
+    <div id="rdpInfo" class="hint">加载中…</div>
+    <div class="actions">
+      <button onclick="setupRdp()">🚀 一键安装/启动 RDP</button>
+      <button class="ghost" onclick="location.href='/api/rdp/file'">⬇ 下载 .rdp 连接文件</button>
+      <button class="ghost" onclick="loadRdpLog()">📜 安装日志</button>
+    </div>
+    <div id="rdpLog" style="display:none; white-space:pre-wrap; max-height:220px;
+         overflow:auto; background:#0d1320; border:1px solid var(--line);
+         border-radius:6px; padding:10px; margin-top:8px;
+         font:12px/1.5 Consolas, monospace"></div>
+    <div class="hint" style="margin-top:8px">
+      同一内网直连，<b>不经过校园网</b>：Windows 双击下载的 .rdp 文件
+      （或运行 <b>mstsc /v:192.168.9.1</b>），用树莓派<b>系统账号/密码</b>登录。
+      3389 只允许 PC/热点子网访问，不会暴露到校园网；首次安装需要树莓派能上网。
+      浏览器不允许网页直接启动 mstsc，所以这里生成 .rdp 文件由 Windows 打开。
+      <b>建议先在下方设置 Web 管理密码</b>，否则同一内网任何人都能打开此页。
+    </div>
+  </section>
+
+  <section>
+    <h2>⚡ 转发延迟优化（fq_codel / RPS / performance）</h2>
+    <div id="tuningInfo" class="hint">加载中…</div>
+    <div class="actions">
+      <button onclick="tuneLatency()">⚡ 一键优化延迟</button>
+    </div>
+    <div class="hint" style="margin-top:8px">
+      关闭网卡 EEE / Wi-Fi 省电、启用 fq_codel 队列、RPS 多核收包、
+      CPU performance 调频；重启后由 campuspi-tuning 服务自动重新应用。
+      会略微增加功耗/温度，请做好散热。
+      RDP 走同一内网直连（PC → 树莓派），不经过校园网转发，延迟基本不受影响。
+    </div>
+  </section>
+
+  <section>
+    <h2>🛠 桌面/任务栏修复</h2>
+    <div class="hint">如果树莓派本地桌面或 RDP 桌面没有任务栏，点下面的按钮自动修复：
+      安装缺失的面板包、恢复默认面板配置/自启动，并在当前 X11 会话重启任务栏；
+      修改前会自动备份配置。</div>
+    <div class="actions">
+      <button onclick="repairDesktop(false)">🛠 修复任务栏</button>
+      <button class="ghost" onclick="repairDesktop(true)">♻ 深度重置面板配置</button>
+      <button class="ghost" onclick="loadDesktopLog()">📜 修复日志</button>
+    </div>
+    <div id="desktopLog" style="display:none; white-space:pre-wrap; max-height:220px;
+         overflow:auto; background:#0d1320; border:1px solid var(--line);
+         border-radius:6px; padding:10px; margin-top:8px;
+         font:12px/1.5 Consolas, monospace"></div>
+    <div class="hint" style="margin-top:8px">
+      LXDE 会立即重启 lxpanel；XFCE 会重启 xfce4-panel；Wayland(labwc) 只能修配置，
+      需注销/重启；RDP 会话请断开重连。深度重置会先备份再重置用户面板配置。
+    </div>
   </section>
 
   <section>
@@ -248,7 +310,11 @@ function saveAuth() {
 }
 
 // ------------------------------------------------------------ 状态卡片
-function esc(s) { return String(s == null ? "" : s); }
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
 
 function renderStatus(s) {
   const badge = v => v === true ? '<span class="badge b-ok">在线</span>'
@@ -283,6 +349,90 @@ function renderStatus(s) {
     '<div class="card"><div class="k">' + c[0] + '</div><div class="v">' +
     c[1] + '</div><div class="hint">' + esc(c[2]) + '</div></div>').join("");
   renderInterfaces(s.interfaces);
+  renderRdp(s.rdp);
+  renderTuning(s.tuning);
+}
+
+function renderRdp(r) {
+  const box = $("rdpInfo");
+  if (!r) { box.textContent = "RDP 状态未知"; return; }
+  const badge = r.running ? '<span class="badge b-ok">运行中</span>'
+    : r.installed ? '<span class="badge b-warn">已安装未运行</span>'
+    : '<span class="badge b-dim">未安装</span>';
+  const busy = r.setup_running
+    ? ' <span class="badge b-warn">安装中…</span>' : '';
+  const users = (r.users && r.users.length)
+    ? r.users.join("、") : "（未找到普通用户）";
+  const addrs = (r.addresses || []).join(" / ");
+  box.innerHTML = badge + busy +
+    '<div class="hint" style="margin-top:6px">地址：' + esc(addrs) +
+    ':3389 · 登录用户：' + esc(users) + '</div>';
+}
+
+async function setupRdp() {
+  if (!confirm("将安装/启动 xrdp 远程桌面。\n首次安装需要树莓派能上网，" +
+               "可能 1-3 分钟。继续？")) return;
+  try {
+    const data = await api("/api/action/setup_rdp",
+                           { method: "POST", body: "{}" });
+    toast((data.ok ? "✅ " : "❌ ") + (data.msg || ""));
+    loadStatus();
+  } catch (e) { toast("请求失败: " + e.message, true); }
+}
+
+async function loadRdpLog() {
+  try {
+    const data = await api("/api/rdp/log?lines=120");
+    const box = $("rdpLog");
+    box.style.display = "block";
+    box.textContent = data.lines || "（暂无日志）";
+    box.scrollTop = box.scrollHeight;
+  } catch (e) { toast("读取日志失败: " + e.message, true); }
+}
+
+function renderTuning(t) {
+  const box = $("tuningInfo");
+  if (!t) { box.textContent = "延迟优化状态未知"; return; }
+  const badge = t.running ? '<span class="badge b-warn">执行中…</span>'
+    : t.applied ? '<span class="badge b-ok">已应用</span>'
+    : '<span class="badge b-dim">未应用</span>';
+  const sum = (t.summary || "").replace(/^applied:\s*/, "");
+  box.innerHTML = badge + (sum
+    ? '<div class="hint" style="margin-top:6px">' + esc(sum) + '</div>' : "");
+}
+
+async function tuneLatency() {
+  if (!confirm("将应用 fq_codel / RPS / performance 等延迟优化" +
+               "（可重复执行），继续？")) return;
+  try {
+    const data = await api("/api/action/tune_latency",
+                           { method: "POST", body: "{}" });
+    toast((data.ok ? "✅ " : "❌ ") + (data.msg || ""));
+    loadStatus();
+  } catch (e) { toast("请求失败: " + e.message, true); }
+}
+
+async function repairDesktop(reset) {
+  const tip = reset
+    ? "将先备份再重置用户面板配置（任务栏布局恢复默认），继续？"
+    : "将自动检查并修复任务栏（缺包会尝试安装，配置先备份），继续？";
+  if (!confirm(tip)) return;
+  try {
+    const data = await api("/api/action/repair_desktop",
+      { method: "POST", body: JSON.stringify({ reset: !!reset }) });
+    toast((data.ok ? "✅ " : "❌ ") + (data.msg || ""));
+    loadDesktopLog();
+  } catch (e) { toast("请求失败: " + e.message, true); }
+}
+
+async function loadDesktopLog() {
+  try {
+    const data = await api("/api/desktop/log?lines=120");
+    const box = $("desktopLog");
+    box.style.display = "block";
+    box.textContent = data.lines || "（暂无日志）";
+    box.scrollTop = box.scrollHeight;
+  } catch (e) { toast("读取日志失败: " + e.message, true); }
 }
 
 function renderInterfaces(ifaces) {
@@ -352,6 +502,9 @@ function fillForm(c) {
   set("e_host", c.eportal.host); set("e_port", c.eportal.port);
   set("e_path", c.eportal.path);
   set("d_host", c.drcom.host); set("d_port", c.drcom.port);
+  set("d_api_path", c.drcom.api_path);
+  set("d_api_logout_path", c.drcom.api_logout_path);
+  set("d_prefix", c.drcom.account_prefix);
   set("d_path", c.drcom.path);
   set("d_extra", JSON.stringify(c.drcom.extra_params || {}));
   $("drcomBox").style.display =
@@ -408,6 +561,9 @@ function collectForm() {
     eportal: { host: val("e_host"), port: val("e_port"),
                path: val("e_path") },
     drcom: { host: val("d_host"), port: val("d_port"),
+             api_path: val("d_api_path"),
+             api_logout_path: val("d_api_logout_path"),
+             account_prefix: val("d_prefix"),
              path: val("d_path"), extra_params: parseExtra() },
     generic: { login_url: val("g_url"), method: val("g_method"),
                params: params, success_key: val("g_key") },

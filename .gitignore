@@ -12,10 +12,19 @@ __pycache__/
 .venv/
 venv/
 
-# 构建产物
+# 构建产物 / 诊断输出
 *.zip
+*.tar.gz
 *.log
 *.tmp
+diag/
+package/
+
+# 本地一次性排查脚本（依赖本机网卡序号/路径，不入库）
+enable_pc_dhcp.ps1
+renew_pc_dhcp.ps1
+run_deploy_visible.ps1
+run_test_pi_link_elevated.ps1
 
 # 编辑器 / 系统
 .vscode/

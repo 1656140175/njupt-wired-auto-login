@@ -2,11 +2,14 @@
 """校园网认证适配器。
 
 - drcom（哆点 Dr.COM，南邮当前实际使用，默认）：
-    GET http://10.10.244.11:801/eportal/?c=ACSetting&a=Login
-        &DDDDD=<学号+运营商后缀>&upass=<密码>&0MKKey=123456
-    单步、明文、无 challenge。登录后服务器 302 跳转：
-    Dr.COMWebLoginID_3.htm=成功 / Dr.COMWebLoginID_2.htm=失败（以最终 URL 判定）。
-    参数名/路径来自 a79.htm 页面配置，可在 Web 后台修改。
+    2026-11 网关已升级为新版 ePortal（a79.htm 的 page.portal_api）：
+    GET http://10.10.244.11:801/eportal/portal/login
+        ?callback=jsonpReturn&login_method=1
+        &user_account=,0,<学号+运营商后缀>&user_password=<密码>
+        &wlan_user_ip=<本机校园网 IP>&wlan_user_mac=<MAC>&jsVersion=4.1.3
+    返回 JSONP（jsonpReturn({...})）：result=1/ok 成功；失败看 ret_code + msg。
+    旧版 /eportal/?c=ACSetting&a=Login 已经不再处理登录（现在返回 EPortal
+    管理页 HTML），仅作为其他学校旧网关的回退。
 - eportal（锐捷，备用）：
     GET http://host:801/eportal/portal/login?login_method=1&user_account=,0,<账号>&user_password=<密码>
 - srun（深澜）：
@@ -29,7 +32,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from utils import get_ip
+from utils import get_ip, get_mac, iface_exists
 
 log = logging.getLogger("campuspi.portal")
 
@@ -38,8 +41,9 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
 
 
 def _decode(body):
-    """门户响应多为 GBK(gb2312)，部分为 UTF-8：按序尝试。"""
-    for enc in ("gbk", "utf-8"):
+    """门户响应 UTF-8 / GBK 混杂：先试 UTF-8，失败再按 GBK 解码。
+    （顺序不能反：UTF-8 中文按 GBK 通常"能解码"但得到乱码，反不过来。）"""
+    for enc in ("utf-8", "gbk"):
         try:
             return body.decode(enc)
         except UnicodeDecodeError:
@@ -59,6 +63,8 @@ def strip_jsonp(text):
 class Portal:
     def __init__(self, app):
         self.app = app
+        # 新版 ePortal 最近一次登录的 ret_code（供上层判断是否值得重试）
+        self.last_ret_code = None
 
     # ------------------------------------------------------------------ 探测
     @staticmethod
@@ -75,11 +81,18 @@ class Portal:
 
     def _is_captive(self, final_url, body, cfg):
         """响应是否被网关劫持（未认证特征：跳到认证页/返回认证页内容）。
-        端点匹配用 host:port（劫持跳转 URL 必带端口，避免误伤探测 URL 自身）。"""
+        端点匹配用 host:port（劫持跳转 URL 必带端口，避免误伤探测 URL 自身）。
+        南邮实际劫持页有两种：
+          1) <script>location.href="http://10.10.244.11/a79.htm"</script>
+             （URL 不变、无 302，只靠 a79.htm 识别！）
+          2) 302 到 a79.htm / ePortal 页面
+        """
         text = (final_url + " " + body).lower()
         host, port = self._gateway_hostport(cfg)
         endpoint = "%s:%d" % (host, port) if host else ""
         return ("eportal" in text or "loginid" in text
+                or "a79.htm" in text
+                or "authentication is required" in text
                 or (endpoint and endpoint in text)
                 or "dr.com" in text or "认证" in text)
 
@@ -121,6 +134,11 @@ class Portal:
         （未认证时 HTTP 被网关劫持/阻断，可识别）。
         """
         cfg = cfg or self.app.config.data
+        # 校园网接口没有 IP 时，即使别的接口能通网关也不能算在线；
+        # 此时登录必然失败（wlan_user_ip 为空/链路本地）。
+        iface = (cfg.get("campus") or {}).get("iface", "eth0")
+        if iface_exists(iface) and not self.local_ip(iface):
+            return "offline", "校园网接口 %s 无 IP（等待 DHCP）" % iface
         host, port = self._gateway_hostport(cfg)
         if not host or not self._link_up(host, port, 3):
             return "offline", "ping 网关 %s 不通（链路断）" % (host or "?")
@@ -195,51 +213,380 @@ class Portal:
             return _decode(resp.read(65536)), resp.geturl()
 
     # --------------------------------------------------------------- drcom
+    @staticmethod
+    def _safe_err(exc):
+        """异常文本脱敏：新版接口密码在 URL 查询串里，绝不能写进日志。"""
+        try:
+            if isinstance(exc, urllib.error.HTTPError):
+                return "HTTP %d" % exc.code
+            text = re.sub(r"\?[^\s'\"]*", "?…", str(exc))
+            return text[:200]
+        except Exception:
+            return exc.__class__.__name__
+
     def _drcom_login(self, cfg):
-        """南邮哆点 Dr.COM：GET 单步、明文，302 跳转页判定。"""
+        """哆点登录：优先新版 ePortal JSONP 接口，接口不可用时回退旧版表单。
+
+        南邮 2026-11 网关升级后，旧路径 /eportal/?c=ACSetting&a=Login
+        只会返回 EPortal 管理页 HTML；a79.htm 页面已改用
+        page.portal_api + 'login'，即 /eportal/portal/login。
+        """
+        self.last_ret_code = None
         campus = cfg["campus"]
         base_username = (campus.get("username") or "").strip()
         password = campus.get("password") or ""
         if not base_username or not password:
             return False, "未配置校园网账号/密码"
-        dr = cfg.get("drcom", {})
+        dr = cfg.get("drcom") or {}
         host = dr.get("host", "")
         if not host:
             return False, "未配置哆点网关地址(host)"
         isp = (campus.get("isps") or {}).get(campus.get("isp", "campus")) or {}
         username = base_username + str(isp.get("username_suffix") or "")
+        # 不要根据 a79.htm 的静态 carrier 列表清空后缀。
+        # 实际在线账号可能是 学号@cmcc（移动绑定），即使页面显示“无后缀”：
+        # 在线会话里 user_account=<学号>@cmcc，isp_bind_account 也是手机号。
+        # 后缀以配置 campus.isp 为准；a79 的 carrier 只用于失败诊断。
+        if not str(isp.get("username_suffix") or "").strip():
+            log.info("当前配置运营商为无后缀，使用纯学号登录")
+        else:
+            log.info("使用配置的运营商后缀 %r",
+                     isp.get("username_suffix"))
+        iface = campus.get("iface", "eth0")
+        ip = self.local_ip(iface)
+        if not ip or ip == "0.0.0.0":
+            return False, ("校园网接口 %s 无 IP：请检查网线/DHCP 后再试"
+                           % iface)
+
+        # a79.htm 的 a41.js 里 page.path='/drcom/'、login_method=0，
+        # 所以当前网关真正的登录接口是 /drcom/login（带 default_login 的全套
+        # 字段），不是 /eportal/portal/login。先试这个，接口不存在再回退。
+        drcom_path = str(dr.get("drcom_path") or "").strip()
+        if drcom_path:
+            result = self._drcom_login_drcom(dr, drcom_path, username,
+                                             password, ip, iface)
+            if result is not None:
+                return result
+            log.warning("Dr.COM /drcom/login 无有效响应，回退 ePortal 接口")
+
+        api_path = str(dr.get("api_path") or "").strip()
+        if api_path:
+            result = self._drcom_login_ep(dr, api_path, username, password,
+                                          ip, iface)
+            if result is not None:
+                ok, msg = result
+                if ok:
+                    return ok, msg
+                # ePortal 的 ret_code=1 信息太笼统（“认证出现异常”）。
+                # 旧版表单会返回具体原因，例如：
+                #   运营商账号在线数超出限制... (Rad:Limit Users Err)
+                #   本账号费用超支，禁止使用
+                # 因此再用旧版表单试一次，并把它作为最终结果。
+                log.warning("ePortal 登录失败: %s；改用旧版表单获取详细结果",
+                            msg)
+            else:
+                log.warning("新版 ePortal 登录接口无有效响应，回退旧版表单登录")
+        else:
+            log.warning("未配置 drcom.api_path，使用旧版表单登录")
+        return self._drcom_login_legacy(dr, username, password, ip, iface)
+
+    def _carrier_options(self, dr):
+        """从 a79.htm 读取网关当前给出的运营商名称/后缀（诊断用）。
+
+        在树莓派的有线网络里读取到的就是该入口真实的选项；账号/运营商
+        报错时把它打进日志，用户照着改 Web 后台即可。
+        """
+        host = dr.get("host", "")
+        if not host:
+            return []
+        try:
+            body = self._fetch("http://%s/a79.htm" % host, timeout=5)
+        except Exception:
+            return []
+        match = re.search(r"carrier='([^']+)'", body, re.S)
+        if not match:
+            return []
+        try:
+            obj = json.loads(match.group(1))
+        except ValueError:
+            return []
+        out = []
+        for item in ((obj.get("yys") or {}).get("data") or []):
+            if isinstance(item, dict):
+                out.append((str(item.get("name") or ""),
+                            str(item.get("suffix") or "")))
+        return out
+
+    def _drcom_login_drcom(self, dr, path, username, password, ip, iface):
+        """Dr.COM 页面 login_method=0 的 /drcom/login 接口。
+
+        a79.htm 引用的 a41.js 里 page.path = .../drcom/、login_method = 0，
+        default_login() 实际请求的是 <host>:801/drcom/login，并携带
+        DDDDD/upass/0MKKey/R1/R2/R3/R6/v4ip/v6ip 以及 user_account 等字段。
+        这里按页面字段原样发送；接口不存在/非 JSON 时返回 None，交给
+        ePortal 接口回退。"""
+        scheme = dr.get("scheme", "http")
+        host = dr.get("host", "")
+        port = dr.get("port", 801)
+        url = "%s://%s:%s%s" % (scheme, host, port, path)
+        mac = (dr.get("wlan_user_mac") or get_mac(iface)
+               or "000000000000").replace(":", "").lower()
+        params = {
+            "callback": dr.get("callback", "jsonpReturn"),
+            "DDDDD": username,
+            "upass": password,
+            "0MKKey": "123456",
+            "R1": "0",
+            "R2": "",
+            "R3": "0",
+            "R6": "0",
+            "v4ip": ip,
+            "v6ip": "",
+            "user_account": str(dr.get("account_prefix", ",0,")) + username,
+            "user_password": password,
+            "wlan_user_ip": ip,
+            "wlan_user_ipv6": "",
+            "wlan_user_mac": mac,
+            "wlan_ac_ip": "",
+            "wlan_ac_name": "",
+            "jsVersion": str(dr.get("js_version", "4.1.3")),
+            "terminal_type": "1",       # 1=PC
+            "lang": "zh",
+            "operate": "portal_login",
+            "login_method": "0",
+        }
+        params.update({str(k): str(v)
+                       for k, v in (dr.get("drcom_extra_params") or {}).items()})
+        try:
+            body = self._fetch(url, params, timeout=10)
+        except Exception as exc:
+            log.warning("Dr.COM /drcom/login 请求失败: %s", self._safe_err(exc))
+            return None
+        try:
+            obj = strip_jsonp(body)
+        except Exception:
+            preview = body.replace("\n", " ")[:160]
+            if "<title>EPortal</title>" in body \
+                    or "/eportal/public/static" in body:
+                log.warning("Dr.COM /drcom/login 返回管理页 HTML: %s", preview)
+            else:
+                log.warning("Dr.COM /drcom/login 返回非 JSON: %s", preview)
+            return None
+        if not isinstance(obj, dict):
+            return None
+        result = obj.get("result")
+        if result in (1, "1", "ok", True):
+            return True, "登录成功（Dr.COM /drcom/login）"
+        if "result" not in obj and "ret_code" not in obj:
+            msg = str(obj.get("msg") or "")
+            if "404" in msg and "not found" in msg.lower():
+                log.warning("Dr.COM /drcom/login 不存在: %s", msg[:150])
+            return None
+        ret = obj.get("ret_code")
+        try:
+            ret_int = int(ret)
+        except (TypeError, ValueError):
+            ret_int = None
+        self.last_ret_code = ret_int
+        msg = str(obj.get("msg") or obj.get("error") or "未知错误").strip()
+        if ret_int == 2 or "已经在线" in msg:
+            return True, "终端 IP 已在线（%s）" % (msg or "ret_code=2")
+        log.warning("Dr.COM /drcom/login 登录失败: result=%s ret_code=%s msg=%s",
+                    result, ret, msg[:200])
+        hint = ""
+        if ret_int in (1, 4):
+            options = self._carrier_options(dr)
+            if options:
+                hint = "；可用后缀：" + " / ".join(
+                    suffix or "无后缀" for _, suffix in options)
+        return False, "登录失败: %s%s" % (msg[:200] or "未知错误", hint)
+
+    def _drcom_login_ep(self, dr, api_path, username, password, ip, iface):
+        """新版 ePortal JSONP 登录。
+        返回 (ok, msg)；接口不存在/返回非 JSON 时返回 None（交给旧版回退）。"""
+        scheme = dr.get("scheme", "http")
+        host = dr.get("host", "")
+        port = dr.get("port", 801)
+        url = "%s://%s:%s%s" % (scheme, host, port, api_path)
+        mac = (dr.get("wlan_user_mac") or get_mac(iface)
+               or "000000000000").replace(":", "").lower()
+        # 与 a79.htm 里 login.login_portal() 的 data 完全一致
+        params = {
+            "callback": dr.get("callback", "jsonpReturn"),
+            "login_method": str(dr.get("login_method", "1")),
+            "is_base64encode": "0",
+            "user_account": str(dr.get("account_prefix", ",0,")) + username,
+            "user_password": password,
+            "wlan_user_ip": ip,
+            "wlan_user_ipv6": "",
+            "wlan_user_mac": mac,
+            "wlan_vlan_id": "0",
+            "wlan_ac_ip": "",
+            "wlan_ac_name": "",
+            "authex_enable": "",
+            "jsVersion": str(dr.get("js_version", "4.5.1")),
+            "terminal_type": "1",       # 1=PC（手机/平板为 2/3）
+            "lang": "zh",
+            "uuid": "",
+        }
+        # 新版专用附加参数（不要把旧版表单字段 0MKKey 等塞进来）
+        params.update({str(k): str(v)
+                       for k, v in (dr.get("api_extra_params") or {}).items()})
+        try:
+            body = self._fetch(url, params, timeout=10)
+        except Exception as exc:
+            log.warning("新版 ePortal 登录请求失败: %s", self._safe_err(exc))
+            return None
+        try:
+            obj = strip_jsonp(body)
+        except Exception:
+            preview = body.replace("\n", " ")[:160]
+            if "<title>EPortal</title>" in body \
+                    or "/eportal/public/static" in body:
+                log.error("新版 ePortal 接口 %s 返回了管理页 HTML："
+                          "登录接口地址可能已变更", api_path)
+                return False, "网关返回 EPortal 管理页：登录接口地址可能已变更"
+            log.warning("新版 ePortal 返回非 JSON: %s", preview)
+            return None
+        if not isinstance(obj, dict):
+            return None
+        result = obj.get("result")
+        if result in (1, "1", "ok", True):
+            return True, "登录成功（新版 ePortal）"
+        if "result" not in obj and "ret_code" not in obj:
+            msg = str(obj.get("msg") or "")
+            if "404" in msg and "not found" in msg.lower():
+                log.error("新版 ePortal 登录接口 %s 不存在: %s",
+                          api_path, msg[:150])
+                return False, "登录接口不存在: %s" % msg[:150]
+            return None            # 不认识的结构 -> 交给旧版回退
+        ret = obj.get("ret_code")
+        try:
+            ret_int = int(ret)
+        except (TypeError, ValueError):
+            ret_int = None
+        self.last_ret_code = ret_int
+        msg = str(obj.get("msg") or obj.get("error") or "未知错误").strip()
+        if ret_int == 2 or "已经在线" in msg:
+            return True, "终端 IP 已在线（%s）" % (msg or "ret_code=2")
+        log.warning("新版 ePortal 登录失败: result=%s ret_code=%s msg=%s",
+                    result, ret, msg[:200])
+        hint = ""
+        if ret_int in (1, 4):
+            options = self._carrier_options(dr)
+            if options:
+                log.warning(
+                    "网关登录页（a79.htm）当前运营商选项：%s",
+                    "、".join("%s(%s)" % (name, suffix or "无后缀")
+                             for name, suffix in options))
+                hint = "；可用后缀：" + " / ".join(
+                    suffix or "无后缀" for _, suffix in options)
+        return False, "登录失败: %s%s" % (msg[:200] or "未知错误", hint)
+
+    def _drcom_login_legacy(self, dr, username, password, ip="", iface=None):
+        """旧版表单登录（a79.htm 的 authloginpath，POST 到 801）。
+
+        除了老网关，这个接口还能给出 ePortal JSONP 不会返回的具体失败原因
+        （在线数超限/欠费/账号绑定等），所以也作为 ePortal 失败后的诊断回退。"""
+        self.last_ret_code = None
+        if iface and not ip:
+            ip = get_ip(iface) or ""
+        mac = (dr.get("wlan_user_mac") or (get_mac(iface) if iface else "")
+               or "").replace(":", "").lower()
         params = {dr.get("user_field", "DDDDD"): username,
                   dr.get("pass_field", "upass"): password}
-        params.update({str(k): str(v) for k, v in (dr.get("extra_params") or {}).items()})
-        # 页面 f0 表单 method=post：与浏览器一致用 POST 提交
-        base = "%s://%s:%s%s" % (dr.get("scheme", "http"), host,
+        params.update({
+            "user_account": str(dr.get("account_prefix", ",0,")) + username,
+            "user_password": password,
+            "wlan_user_ip": ip,
+            "wlan_user_ipv6": "",
+            "wlan_user_mac": mac,
+            "wlan_ac_ip": "",
+            "wlan_ac_name": "",
+            "jsVersion": str(dr.get("js_version", "4.5.1")),
+            "terminal_type": "1",
+            "operate": "portal_login",
+        })
+        params.update({str(k): str(v)
+                       for k, v in (dr.get("extra_params") or {}).items()})
+        base = "%s://%s:%s%s" % (dr.get("scheme", "http"), dr.get("host", ""),
                                  dr.get("port", 801),
-                                 dr.get("path", "/eportal/?c=ACSetting&a=Login"))
+                                 dr.get("path",
+                                        "/eportal/?c=ACSetting&a=Login"))
         try:
             body, final_url = self._fetch_resp(base, None, params, timeout=10)
         except Exception as exc:
-            return False, "哆点登录请求失败: %s" % exc
+            return False, "哆点登录请求失败: %s" % self._safe_err(exc)
         low = (body + " " + final_url).lower()
         for key in dr.get("fail_keys") or ["2.htm"]:
             if key.lower() in low:
-                # 网关返回的正文是诊断关键，完整打进日志
                 body_preview = body.replace("\n", " ")[:200]
-                log.warning("哆点登录失败: %s | 网关响应: %s",
+                log.warning("哆点旧版登录失败: %s | 网关响应: %s",
                             final_url[:120], body_preview)
+                self.last_ret_code = 1
                 return False, "哆点返回失败: %s" % body_preview
         for key in dr.get("success_keys") or ["3.htm"]:
             if key.lower() in low:
+                self.last_ret_code = None
                 return True, "哆点登录成功（%s）" % final_url[:80]
-        # 无明确标志也视为已受理，最终以登录后探测为准
+        self.last_ret_code = None
         return True, "哆点登录请求已发送（等待在线探测确认）"
 
+    def _drcom_logout_ep(self, dr, api_path, ip, iface):
+        """新版 ePortal 注销。返回 (ok, msg)；接口不可用返回 None。"""
+        scheme = dr.get("scheme", "http")
+        host = dr.get("host", "")
+        port = dr.get("port", 801)
+        url = "%s://%s:%s%s" % (scheme, host, port, api_path)
+        mac = (dr.get("wlan_user_mac") or get_mac(iface)
+               or "000000000000").replace(":", "").lower()
+        params = {
+            "callback": dr.get("callback", "jsonpReturn"),
+            "login_method": "1",
+            "user_account": "drcom",
+            "user_password": "123",
+            "ac_logout": "1",
+            "register_mode": str(dr.get("register_mode", "1")),
+            "wlan_user_ip": ip,
+            "wlan_user_ipv6": "",
+            "wlan_vlan_id": str(dr.get("vlan_id", "0")),
+            "wlan_user_mac": mac,
+            "wlan_ac_ip": "",
+            "wlan_ac_name": "",
+            "jsVersion": str(dr.get("js_version", "4.1.3")),
+        }
+        try:
+            body = self._fetch(url, params, timeout=8)
+        except Exception as exc:
+            log.warning("新版 ePortal 注销请求失败: %s", self._safe_err(exc))
+            return None
+        try:
+            obj = strip_jsonp(body)
+        except Exception:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        if obj.get("result") in (1, "1", "ok", True):
+            return True, "注销成功（新版 ePortal）"
+        msg = str(obj.get("msg") or obj.get("error") or "未知错误")[:150]
+        return False, "注销失败: %s" % msg
+
     def logout(self, cfg=None):
-        """哆点注销（配置里 authlogoutpath）。返回 (ok, 说明)。"""
+        """哆点注销：优先新版 ePortal 接口，失败回退旧版路径。"""
         cfg = cfg or self.app.config.data
         dr = cfg.get("drcom", {})
         host = dr.get("host", "")
         if not host:
             return False, "未配置哆点网关地址"
+        campus = cfg.get("campus") or {}
+        iface = campus.get("iface", "eth0")
+        ip = self.local_ip(iface)
+        api_path = str(dr.get("api_logout_path") or "").strip()
+        if api_path and ip and ip != "0.0.0.0":
+            result = self._drcom_logout_ep(dr, api_path, ip, iface)
+            if result is not None:
+                return result
+            log.warning("新版 ePortal 注销接口无有效响应，回退旧版注销")
         url = "%s://%s:%s%s" % (dr.get("scheme", "http"), host,
                                 dr.get("port", 801),
                                 dr.get("logout_path",
@@ -247,8 +594,8 @@ class Portal:
         try:
             body, final_url = self._fetch_resp(url, timeout=8)
         except Exception as exc:
-            return False, "注销请求失败: %s" % exc
-        logging.info("哆点注销已发送: %s", final_url[:100])
+            return False, "注销请求失败: %s" % self._safe_err(exc)
+        logging.info("哆点旧版注销已发送: %s", final_url[:100])
         return True, "注销请求已发送"
 
     # -------------------------------------------------------------- eportal

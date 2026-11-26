@@ -20,6 +20,7 @@ import logging.handlers
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -31,7 +32,7 @@ from hotspot import Hotspot
 from network import Network
 from portal import Portal
 from utils import (carrier, get_ip, iface_exists, ensure_dhcp, sync_time,
-                   time_trustworthy)
+                   time_trustworthy, run)
 import nla
 import webui
 
@@ -67,6 +68,8 @@ class App:
         self.last_login = {"ts": "", "ok": None, "msg": ""}
         self.pc_state = None
         self._last_sync = 0.0
+        self._rdp_running = False
+        self._tuning_running = False
 
         self.logs = collections.deque(maxlen=600)
         self._ring = RingHandler(self.logs)
@@ -163,12 +166,24 @@ class App:
         if not ip or ip == "0.0.0.0":
             logging.info("校园网接口 %s 无 IP，先请求 DHCP", iface)
             ensure_dhcp(iface)
+            # DHCP 可能失败：必须先复查 IP，否则新版接口会因 wlan_user_ip
+            # 为空直接返回"账号错误"，日志会误导排查方向。
+            ip = self.portal.local_ip()
+        if not ip or ip == "0.0.0.0":
+            msg = "校园网接口 %s 未取得 IP（DHCP 失败），无法登录" % iface
+            logging.warning("[%s] %s", reason, msg)
+            self.last_login = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                               "ok": False, "msg": msg}
+            return False, msg
+        logging.info("校园网接口 %s 当前 IP: %s", iface, ip)
         with self.login_lock:
             ok, msg = self.portal.login()
         self.last_login = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                            "ok": ok, "msg": msg}
         logging.info("[%s] 登录结果: %s", reason, msg)
         if ok:
+            # 给 AC 一点时间放行会话，避免登录成功后探测过早仍判定未认证
+            time.sleep(1.5)
             self.probe_now()
             threading.Thread(target=sync_time, daemon=True,
                              name="sync-time-after-login").start()
@@ -185,6 +200,15 @@ class App:
                 if state == "online":
                     pass                      # 正常，走周期休眠
                 elif state == "offline":
+                    # 网线插着但接口无 IP（刚启动/租约过期）：先要 DHCP，
+                    # 否则会白等一个 check_interval（默认 30 分钟）。
+                    iface = self.config.data["campus"]["iface"]
+                    if "无 IP" in self.last_probe.get("msg", "") \
+                            and carrier(iface):
+                        logging.info("校园网接口 %s 无 IP，尝试 DHCP", iface)
+                        ensure_dhcp(iface)
+                        self._sleep(5)
+                        continue
                     if self.quiet_hours_active():
                         # 物理断网窗口：暂停重连，但持续轻探测（2 分钟）
                         logging.info("静默时段且链路断，暂停重连")
@@ -192,7 +216,16 @@ class App:
                         continue
                     logging.info("链路不可达（非静默时段），等待网络恢复")
                 else:                          # need_login：链路通=有网，
-                    self.ensure_campus("周期检测")   # 静默时段也登录
+                    # 刚探测过 need_login，直接登录（force 跳过二次探测，
+                    # 避免探测抖动把登录机会拖到 30 分钟后）
+                    self.ensure_campus("周期检测", force=True)
+                    # 账号/运营商错误是确定性的：别再每 30 分钟撞一次，
+                    # 避免错误密码累计触发网关风控。Web 改配置后会立即重试。
+                    if self.portal.last_ret_code in (1, 4):
+                        logging.warning("账号或运营商校验失败，"
+                                        "暂停自动重试 1 小时（配置变更立即重试）")
+                        self._sleep(3600)
+                        continue
             except Exception:
                 logging.exception("周期检测异常")
             interval = self.config.data["campus"]["check_interval"]
@@ -255,8 +288,18 @@ class App:
             if not self.running or self.online:
                 break
             logging.info("PC 接入触发登录（第 %d/%d 次）", i, attempts)
-            self.ensure_campus("PC 接入触发", force=True)
+            ok, msg = self.ensure_campus("PC 接入触发", force=True)
             if self.online:
+                break
+            # DHCP 没拿到 IP：再试也是白等，交给下一轮链路检测
+            if "未取得 IP" in msg:
+                logging.warning("校园网接口未取得 IP，停止本轮重试")
+                break
+            # 账号/运营商错误是确定性的，重试只会触发网关风控，直接停
+            if self.portal.last_ret_code in (1, 4):
+                logging.warning("账号或运营商校验失败（ret_code=%s），"
+                                "停止重试；请在 Web 后台检查账号和运营商",
+                                self.portal.last_ret_code)
                 break
             if i < attempts:
                 self._sleep(delay)
@@ -278,6 +321,192 @@ class App:
             except Exception:
                 logging.exception("转发规则兜底异常")
             self._sleep(30)
+
+    # ------------------------------------------------------------- 远程桌面
+    @staticmethod
+    def _rdp_script():
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "setup_rdp.sh")
+
+    def rdp_status(self):
+        """xrdp 安装/运行状态 + 可登录的系统用户（给 Web 后台用）。"""
+        installed = shutil.which("xrdp") is not None
+        running = False
+        if installed:
+            proc = run(["systemctl", "is-active", "xrdp"], timeout=5)
+            running = bool(proc and proc.returncode == 0
+                           and proc.stdout.strip() == "active")
+        users = []
+        try:
+            with open("/etc/passwd", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    parts = line.strip().split(":")
+                    if len(parts) < 7:
+                        continue
+                    try:
+                        uid = int(parts[2])
+                    except ValueError:
+                        continue
+                    if 1000 <= uid < 60000 and parts[6] not in (
+                            "/usr/sbin/nologin", "/sbin/nologin",
+                            "/bin/false"):
+                        users.append(parts[0])
+        except OSError:
+            pass
+        pc = self.config.data.get("pc") or {}
+        hs = self.config.data.get("hotspot") or {}
+        return {
+            "installed": installed,
+            "running": running,
+            "setup_running": self._rdp_running,
+            "port": 3389,
+            "users": users,
+            "addresses": [pc.get("gateway", "192.168.9.1"),
+                          hs.get("gateway", "192.168.10.1")],
+            "script": os.path.exists(self._rdp_script()),
+        }
+
+    def rdp_file_text(self, host):
+        """生成 Windows .rdp 文件内容（登录密码不写入，弹窗输入）。"""
+        users = self.rdp_status().get("users") or []
+        user = users[0] if len(users) == 1 else ""
+        lines = [
+            "full address:s:%s:3389" % host,
+            "username:s:%s" % user,
+            # xrdp 自己会弹登录窗（Session 选 Xorg），不要让 Windows
+            # 先弹一次凭据窗口；也不要尝试 xrdp 不支持的 CredSSP/NLA。
+            "prompt for credentials:i:0",
+            # 局域网自签证书：连接时不再弹证书警告（仅内网使用）
+            "authentication level:i:0",
+            "enablecredsspsupport:i:0",
+            "screen mode id:i:2",
+            "use multimon:i:0",
+            "desktopwidth:i:1920",
+            "desktopheight:i:1080",
+            "session bpp:i:32",
+            "clipboard:i:1",
+            "redirectclipboard:i:1",
+            "audiomode:i:0",
+            "autoreconnection enabled:i:1",
+            "bandwidthautodetect:i:1",
+            "networkautodetect:i:1",
+            "connection type:i:6",
+            "displayconnectionbar:i:1",
+        ]
+        return "\r\n".join(lines) + "\r\n"
+
+    def setup_rdp(self):
+        """后台执行 setup_rdp.sh（安装/启动 xrdp），返回立即响应。"""
+        if self._rdp_running:
+            return False, "RDP 安装/启动已在进行中，请稍候"
+        script = self._rdp_script()
+        if not os.path.exists(script):
+            return False, "缺少 setup_rdp.sh，请重新运行 install.sh 部署"
+        self._rdp_running = True
+        log_path = "/var/log/campuspi-rdp.log"
+
+        def worker():
+            try:
+                with open(log_path, "ab") as fh:
+                    fh.write(("\n==== %s ====\n" % time.strftime(
+                        "%Y-%m-%d %H:%M:%S")).encode("utf-8"))
+                    fh.flush()
+                    proc = subprocess.run(["bash", script], stdout=fh,
+                                          stderr=subprocess.STDOUT,
+                                          timeout=1800)
+                logging.info("RDP 安装脚本结束，返回码 %s", proc.returncode)
+            except Exception:
+                logging.exception("RDP 安装脚本执行异常")
+            finally:
+                self._rdp_running = False
+
+        threading.Thread(target=worker, daemon=True,
+                         name="rdp-setup").start()
+        return True, "已开始安装/启动 RDP，约 1-3 分钟；完成后刷新状态"
+
+    # ------------------------------------------------------------- 延迟优化
+    @staticmethod
+    def _tuning_script():
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "setup_tuning.sh")
+
+    def tuning_status(self):
+        summary = ""
+        try:
+            with open("/run/campuspi-tuning.status", "r",
+                      encoding="utf-8") as fh:
+                summary = fh.read().strip()
+        except OSError:
+            pass
+        return {"applied": summary.startswith("applied:"),
+                "summary": summary, "running": self._tuning_running}
+
+    def tune_latency(self):
+        """执行 setup_tuning.sh（fq_codel/RPS/performance/EEE off）。
+
+        脚本只做幂等调优，通常 1-3 秒完成，所以同步执行并把结果直接
+        返回给 Web 后台。
+        """
+        if self._tuning_running:
+            return False, "延迟优化正在执行，请稍候"
+        script = self._tuning_script()
+        if not os.path.exists(script):
+            return False, "缺少 setup_tuning.sh，请重新运行 install.sh 部署"
+        self._tuning_running = True
+        try:
+            proc = subprocess.run(["bash", script], capture_output=True,
+                                  text=True, timeout=90)
+            output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+            tail = output.splitlines()[-1] if output else ""
+            logging.info("转发延迟优化结束，返回码 %s", proc.returncode)
+            if proc.returncode != 0:
+                return False, "优化脚本返回 %d：%s" % (proc.returncode,
+                                                      tail[:200])
+            summary = self.tuning_status().get("summary", "")
+            summary = summary.replace("applied:", "", 1).strip()
+            return True, ("已应用：" + summary) if summary else "已应用延迟优化"
+        except Exception as exc:
+            logging.exception("延迟优化执行异常")
+            return False, "延迟优化失败: %s" % exc
+        finally:
+            self._tuning_running = False
+
+    # ------------------------------------------------------------- 桌面修复
+    @staticmethod
+    def _desktop_script():
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "repair_desktop.sh")
+
+    def repair_desktop(self, reset=False):
+        """执行 repair_desktop.sh，修复 LXDE/XFCE/Wayland 任务栏。"""
+        script = self._desktop_script()
+        if not os.path.exists(script):
+            return False, "缺少 repair_desktop.sh，请重新运行 install.sh 部署"
+        log_path = "/var/log/campuspi-desktop-repair.log"
+        env = os.environ.copy()
+        if reset:
+            env["RESET_PANEL"] = "1"
+        try:
+            proc = subprocess.run(["bash", script], capture_output=True,
+                                  text=True, timeout=180, env=env)
+            output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+            try:
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write("\n==== %s (reset=%s, rc=%s) ====\n"
+                             % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                reset, proc.returncode))
+                    fh.write(output + "\n")
+            except OSError:
+                pass
+            logging.info("桌面修复返回码 %s，输出：\n%s",
+                         proc.returncode, output[-1500:])
+            tail = output.splitlines()[-1] if output else "完成"
+            if proc.returncode == 0:
+                return True, tail
+            return False, "修复脚本返回 %d：%s" % (proc.returncode, tail)
+        except Exception as exc:
+            logging.exception("桌面修复执行异常")
+            return False, "桌面修复失败: %s" % exc
 
     # ------------------------------------------------------------- 状态/配置
     def status(self):
@@ -311,6 +540,8 @@ class App:
                 "client_list": clients[:10],
                 "max_clients": h["max_clients"],
             },
+            "rdp": self.rdp_status(),
+            "tuning": self.tuning_status(),
         }
 
     def save_config(self, incoming):
@@ -335,8 +566,11 @@ class App:
                                  "check_interval"])
         dr = incoming.get("drcom")
         if isinstance(dr, dict):
-            for field in ("host", "port", "scheme", "path", "user_field",
-                          "pass_field", "extra_params"):
+            for field in ("host", "port", "scheme", "path", "drcom_path",
+                          "api_path", "api_logout_path", "callback",
+                          "login_method", "js_version", "account_prefix",
+                          "user_field", "pass_field", "extra_params",
+                          "api_extra_params", "drcom_extra_params"):
                 if field in dr:
                     cfg["drcom"][field] = dr[field]
         ep = incoming.get("eportal")
@@ -518,6 +752,19 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--detect":
         detect_command()
         return
+    if len(sys.argv) > 1 and sys.argv[1] in ("--check-login", "--test-login"):
+        # 用 /etc/campuspi/config.json 当前账号真实登录一次，便于部署后验证
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+        app = App()
+        ok, msg = app.ensure_campus("命令行测试", force=True)
+        print("")
+        print(("登录成功" if ok else "登录失败") + ": " + msg)
+        if ok:
+            print("在线探测: %s (%s)" % (app.last_probe.get("state"),
+                                        app.last_probe.get("msg")))
+        return 0 if ok else 1
     app = App()
 
     def stop(signum, frame):
@@ -530,4 +777,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

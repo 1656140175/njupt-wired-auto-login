@@ -45,19 +45,37 @@ DEFAULTS = {
             {"url": "http://www.qq.com/", "marker": "腾讯"},
         ],
     },
-    # 南邮哆点 Dr.COM（来自 a79.htm 页面参数）：
-    # GET /eportal/?c=ACSetting&a=Login&DDDDD=<账号>&upass=<密码>（端口 801，明文）
-    # 登录后服务器 302 到 Dr.COMWebLoginID_3.htm(成功) / _2.htm(失败)
+    # 南邮哆点 Dr.COM ePortal（2026-11 网关已升级为新版 JSONP 接口）：
+    #   GET /eportal/portal/login?callback=jsonpReturn&login_method=1
+    #       &user_account=,0,<账号+运营商后缀>&user_password=<密码>
+    #       &wlan_user_ip=<本机校园网 IP>&wlan_user_mac=<MAC>&jsVersion=4.1.3
+    #   返回 jsonpReturn({"result":1,...})；成功 result=1/ok，
+    #   失败 result=0，ret_code=1/4 账号问题、2 已在线、7 Radius 认证失败。
+    # 旧版 /eportal/?c=ACSetting&a=Login 现在只会返回 EPortal 管理页 HTML，
+    # 仅作为其他学校旧网关的回退保留。
     "drcom": {
         "host": "10.10.244.11",
         "port": 801,
         "scheme": "http",
+        # ---------- Dr.COM 页面 login_method=0 的接口（当前主用） ----------
+        # a79.htm 的 a41.js 里 page.path='/drcom/'、login_method=0，
+        # 实际登录地址是 /drcom/login，字段见 default_login()。
+        "drcom_path": "",
+        # ---------- 新版 ePortal JSONP 接口（回退） ----------
+        "api_path": "/eportal/portal/login",
+        "api_logout_path": "/eportal/portal/logout",
+        "callback": "jsonpReturn",
+        "login_method": "1",
+        "js_version": "4.5.1",
+        "account_prefix": ",0,",        # PC：,0,<账号>；手机：,1,
+        # 新版专用附加参数（默认空；不要把旧版 0MKKey 等塞进来）
+        "api_extra_params": {},
+        # ---------- 旧版表单接口（仅旧网关回退） ----------
         "path": "/eportal/?c=ACSetting&a=Login",
         "logout_path": "/eportal/?c=ACSetting&a=Logout&ver=1.0",
         "user_field": "DDDDD",
         "pass_field": "upass",
-        # 页面 f0 表单的全部字段（0MKKey=登录按钮值；其余为空值隐藏字段，
-        # 某些网关要求字段存在；url=drappall 来自 authloginparam 配置）
+        # 旧版页面 f0 表单的全部字段（0MKKey=登录按钮值；其余为空值隐藏字段）
         "extra_params": {
             "0MKKey": "123456", "R1": "0", "R2": "0", "R3": "0", "R6": "0",
             "para": "00", "url": "drappall",
@@ -65,7 +83,7 @@ DEFAULTS = {
             "username": "", "password": "", "user": "", "cmd": "",
             "Login": "", "v6ip": "",
         },
-        # 用子串匹配（"webloginid_3" 可同时命中完整名与短名跳转页）
+        # 旧版用子串匹配（"webloginid_3" 可同时命中完整名与短名跳转页）
         "success_keys": ["webloginid_3", "认证成功", "success"],
         "fail_keys": ["webloginid_2", "认证失败", "密码错误",
                       "用户名或密码", "账号不存在", "error"],
@@ -88,6 +106,9 @@ DEFAULTS = {
         "dhcp_end": "192.168.9.150",
         "attempts": 3,                  # Windows 设备接入时立即尝试次数
         "attempt_delay": 6,             # 每次尝试间隔（秒）
+        # True: 校园网离线时不把 Pi 设为 PC 的网关/DNS，PC 继续走 Wi-Fi。
+        # False: 旧行为，始终下发 192.168.9.1 作为网关/DNS。
+        "share_online_only": True,
     },
     "hotspot": {
         "enabled": True,
